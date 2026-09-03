@@ -157,6 +157,12 @@ export interface RescheduleAppointmentInput {
   customer_id?: string;
   new_start_at: string;
   idempotency_key?: string;
+  /** 无预约码时按条件定位本人预约（按项目/日期/状态） */
+  service_id?: string;
+  service_name?: string;
+  status?: AppointmentStatus;
+  from_date?: string;
+  to_date?: string;
 }
 
 export interface CancelAppointmentInput {
@@ -165,6 +171,12 @@ export interface CancelAppointmentInput {
   customer_id?: string;
   reason?: string;
   idempotency_key?: string;
+  /** 无预约码时按条件定位本人预约（按项目/日期/状态） */
+  service_id?: string;
+  service_name?: string;
+  status?: AppointmentStatus;
+  from_date?: string;
+  to_date?: string;
 }
 
 export interface QueryAppointmentsInput {
@@ -172,6 +184,10 @@ export interface QueryAppointmentsInput {
   from_date?: string;
   to_date?: string;
   status?: AppointmentStatus;
+  /** 按项目名筛选（ILKE 模糊匹配） */
+  service_name?: string;
+  /** 关键字：匹配预约码、项目名、员工名 */
+  keyword?: string;
 }
 
 export interface ListStoresInput {

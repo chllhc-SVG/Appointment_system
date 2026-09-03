@@ -1,7 +1,7 @@
 import { pool } from '../db/pool.js';
 import { writeAudit } from '../audit.js';
 import { withIdempotentOperation } from '../idempotency.js';
-import { addMinutes, assertNonEmpty, hashIdempotencyKey, makeAppointmentCode } from '../utils.js';
+import { addMinutes, assertNonEmpty, hashIdempotencyKey, makeAppointmentCode, normalizeDate, normalizeTimestamp } from '../utils.js';
 import type {
   Appointment,
   AppointmentStatus,
@@ -56,10 +56,11 @@ const resolveCustomerId = (input: CreateAppointmentInput | CancelAppointmentInpu
   return undefined;
 };
 
-/** 数字人直接说项目名："我想预约皮肤管理" → service_name 解析 service_id。 */
-const resolveService = async (input: { service_id?: string; service_name?: string }) => {
+/** 数字人直接说项目名："我想预约皮肤管理" → service_name 解析 service_id。
+ *  门店已配置可做项目时，优先按该店可做范围解析，防止约到门店未开通的项目。 */
+const resolveService = async (input: { service_id?: string; service_name?: string; store_id?: string }) => {
   if (input.service_id?.trim()) return getService(input.service_id.trim());
-  if (input.service_name?.trim()) return findServiceByName(input.service_name);
+  if (input.service_name?.trim()) return findServiceByName(input.service_name, input.store_id?.trim());
   return undefined;
 };
 
@@ -69,6 +70,67 @@ const resolveAppointment = async (input: { appointment_id?: string; appointment_
   if (input.appointment_code?.trim()) return getAppointmentByCode(input.appointment_code.trim());
   return undefined;
 };
+
+type AppointmentLocator = Pick<CancelAppointmentInput, 'appointment_id' | 'appointment_code' | 'service_id' | 'service_name' | 'status' | 'from_date' | 'to_date'>;
+
+/**
+ * 数字人对话定位预约：
+ *   - 有 appointment_id / appointment_code 时精确命中；
+ *   - 否则按"项目 + 日期范围 + 状态"在本人预约中定位；
+ *   - 命中多个返回 AMBIGUOUS（附候选预约码），由数字人向用户二次确认，避免误操作。
+ */
+async function resolveAppointmentForCustomer(
+  customerId: string,
+  locator: AppointmentLocator,
+): Promise<
+  | { ok: true; appointment: Appointment }
+  | { ok: false; error_code: string; message: string; candidates?: Array<{ appointment_id: string; appointment_code: string; service_id: string; start_at: string; status: AppointmentStatus }> }
+> {
+  if (locator.appointment_id?.trim() || locator.appointment_code?.trim()) {
+    const appointment = await resolveAppointment(locator);
+    if (!appointment) return { ok: false, error_code: 'NOT_FOUND', message: '预约不存在' };
+    return { ok: true, appointment };
+  }
+  const matches = await listAppointmentsByCustomer(
+    customerId,
+    locator.from_date,
+    locator.to_date,
+    locator.status,
+    locator.service_name,
+    undefined,
+  );
+  let filtered = matches;
+  if (locator.service_id?.trim()) filtered = filtered.filter((item) => item.service_id === locator.service_id);
+  if (locator.status) filtered = filtered.filter((item) => item.status === locator.status);
+  if (filtered.length === 0) {
+    return { ok: false, error_code: 'NOT_FOUND', message: '未找到匹配的预约，请用 get_my_appointments 确认预约记录' };
+  }
+  if (filtered.length > 1) {
+    return {
+      ok: false,
+      error_code: 'AMBIGUOUS',
+      message: `找到 ${filtered.length} 个匹配的预约，请提供预约码确认`,
+      candidates: filtered.slice(0, 5).map((item) => ({
+        appointment_id: item.id,
+        appointment_code: item.appointment_code,
+        service_id: item.service_id,
+        start_at: item.start_at,
+        status: item.status,
+      })),
+    };
+  }
+  return { ok: true, appointment: filtered[0] };
+}
+
+/** 门店可做范围校验：门店已配置可做项目时，目标项目必须在其中（与后台门店勾选一致）。
+ *  返回 null 表示通过，否则返回业务错误结构（非抛出，避免 MCP 层序列化异常）。 */
+async function checkServiceInStoreScope(store: { id: string; service_ids?: string[] } | undefined, service: { id: string; name: string }) {
+  if (!store) return null;
+  if (store.service_ids && store.service_ids.length > 0 && !store.service_ids.includes(service.id)) {
+    return { success: false as const, error_code: 'STORE_SERVICE_NOT_AVAILABLE', message: `「${service.name}」不在该门店可做项目内，请选择该店其他项目` };
+  }
+  return null;
+}
 
 const appRef = (input: { appointment_id?: string; appointment_code?: string }) =>
   input.appointment_id?.trim() || input.appointment_code?.trim() || 'unknown';
@@ -82,6 +144,7 @@ export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
   | { success: false; error_code: string; message: string }
 > {
   assertNonEmpty(input.date, 'date');
+  const date = normalizeDate(input.date);
   const service = await resolveService(input);
   const bookable = bookableCheck(service);
   if (!bookable.ok) {
@@ -91,7 +154,14 @@ export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
     return { success: false, error_code: 'NOT_FOUND', message: 'service not found（可按 service_id 或 service_name 查询）' };
   }
 
-  const slots = await searchAvailableTimeSlots(service.id, input.store_id, input.date, input.preferred_staff_id);
+  if (input.store_id?.trim()) {
+    const store = await getStore(input.store_id.trim());
+    if (!store) return { success: false, error_code: 'STORE_NOT_FOUND', message: '门店不存在或已停用' };
+    const scopeError = await checkServiceInStoreScope(store, service);
+    if (scopeError) return scopeError;
+  }
+
+  const slots = await searchAvailableTimeSlots(service.id, input.store_id, date, input.preferred_staff_id);
   return {
     success: true,
     service: { id: service.id, name: service.name, duration_minutes: service.duration_minutes },
@@ -108,18 +178,21 @@ export async function createAppointment(input: CreateAppointmentInput) {
   const store = await getStore(input.store_id);
   const staff = await getStaff(input.staff_id);
   if (!service || !store || !staff) throw new Error('Service/store/staff not found');
+  const scopeError = await checkServiceInStoreScope(store, service);
+  if (scopeError) return scopeError;
 
   const staffSkills = await listStaffSkillsForService(service.id, store.id);
   if (!staffSkills.some((item) => item.id === staff.id)) {
     return { success: false, error_code: 'POLICY_DENIED', message: '该员工不支持此项目' };
   }
 
-  const endAt = addMinutes(input.start_at, service.duration_minutes);
+  const startAt = normalizeTimestamp(input.start_at);
+  const endAt = addMinutes(startAt, service.duration_minutes);
   const customerId = resolveCustomerId(input);
   // 数字人链路：idempotency_key 缺省时由"客户+项目+员工+时间"确定性生成，
   // 同一客户对同一时段重复确认只会创建一条，天然幂等。
   const idempotencyKey = normalizeIdempotencyKey(
-    input.idempotency_key?.trim() ?? `create:${customerId ?? 'anon'}:${service.id}:${input.staff_id}:${input.start_at}`,
+    input.idempotency_key?.trim() ?? `create:${customerId ?? 'anon'}:${service.id}:${input.staff_id}:${startAt}`,
   );
 
   const existing = await pool.query('SELECT * FROM appointments WHERE idempotency_key = $1 LIMIT 1', [idempotencyKey]);
@@ -137,7 +210,7 @@ export async function createAppointment(input: CreateAppointmentInput) {
         store_id, staff_id, service_id, start_at, end_at, status, idempotency_key, note
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,$9::timestamptz,$10,$11,$12)
       RETURNING *`,
-      [appointmentCode, finalCustomerId, input.customer_name ?? '到店客户', input.customer_phone ?? '', store.id, staff.id, service.id, input.start_at, endAt, 'confirmed', idempotencyKey, input.note ?? null],
+      [appointmentCode, finalCustomerId, input.customer_name ?? '到店客户', input.customer_phone ?? '', store.id, staff.id, service.id, startAt, endAt, 'confirmed', idempotencyKey, input.note ?? null],
     );
     const appointment = toAppointment(inserted.rows[0] as Record<string, unknown>);
     await writeAudit({
@@ -164,7 +237,7 @@ export async function createAppointment(input: CreateAppointmentInput) {
 export async function getMyAppointments(input: QueryAppointmentsInput) {
   const customerId = resolveCustomerId(input);
   assertCustomerIdentity(customerId);
-  return listAppointmentsByCustomer(customerId!, input.from_date, input.to_date, input.status);
+  return listAppointmentsByCustomer(customerId!, input.from_date, input.to_date, input.status, input.service_name, input.keyword);
 }
 
 export async function listAppointments(input: {
@@ -172,6 +245,7 @@ export async function listAppointments(input: {
   store_id?: string;
   staff_id?: string;
   service_id?: string;
+  service_name?: string;
   from_date?: string;
   to_date?: string;
   status?: AppointmentStatus;
@@ -243,14 +317,25 @@ export async function cancelAppointment(input: CancelAppointmentInput) {
   const customerId = resolveCustomerId(input);
   assertCustomerIdentity(customerId);
 
+  const locator = {
+    appointment_id: input.appointment_id,
+    appointment_code: input.appointment_code,
+    service_id: input.service_id,
+    service_name: input.service_name,
+    status: input.status,
+    from_date: input.from_date,
+    to_date: input.to_date,
+  };
+  const resolved = await resolveAppointmentForCustomer(customerId!, locator);
+  if (!resolved.ok) return resolved;
+  const appointment = resolved.appointment;
+
   return withIdempotentOperation({
-    operationKey: `cancel:${input.idempotency_key?.trim() ?? appRef(input)}:${customerId}`,
-    appointmentId: input.appointment_id ?? input.appointment_code ?? undefined,
+    operationKey: `cancel:${input.idempotency_key?.trim() ?? appRef(input)}:${customerId}:${appointment.id}`,
+    appointmentId: appointment.id,
     action: 'cancel',
     requestPayload: { appointment_ref: appRef(input), customer_id: customerId, reason: input.reason ?? null },
     execute: async () => {
-      const appointment = await resolveAppointment(input);
-      if (!appointment) return { success: false, error_code: 'NOT_FOUND', message: '预约不存在' };
       if (appointment.customer_id !== customerId) return { success: false, error_code: 'POLICY_DENIED', message: '无权操作该预约' };
       if (appointment.status === 'cancelled' || appointment.status === 'completed' || appointment.status === 'checked_in' || appointment.status === 'no_show') return { success: false, error_code: 'INVALID_STATE', message: '当前状态不允许取消' };
 
@@ -288,21 +373,33 @@ export async function cancelAppointment(input: CancelAppointmentInput) {
 export async function rescheduleAppointment(input: RescheduleAppointmentInput) {
   const customerId = resolveCustomerId(input);
   assertCustomerIdentity(customerId);
+  const newStartAt = normalizeTimestamp(input.new_start_at);
+
+  const locator = {
+    appointment_id: input.appointment_id,
+    appointment_code: input.appointment_code,
+    service_id: input.service_id,
+    service_name: input.service_name,
+    status: input.status,
+    from_date: input.from_date,
+    to_date: input.to_date,
+  };
+  const resolved = await resolveAppointmentForCustomer(customerId!, locator);
+  if (!resolved.ok) return resolved;
+  const appointment = resolved.appointment;
 
   return withIdempotentOperation({
-    operationKey: `reschedule:${input.idempotency_key?.trim() ?? appRef(input)}:${customerId}:${input.new_start_at}`,
-    appointmentId: input.appointment_id ?? input.appointment_code ?? undefined,
+    operationKey: `reschedule:${input.idempotency_key?.trim() ?? appRef(input)}:${customerId}:${appointment.id}:${newStartAt}`,
+    appointmentId: appointment.id,
     action: 'reschedule',
-    requestPayload: { appointment_ref: appRef(input), customer_id: customerId, new_start_at: input.new_start_at },
+    requestPayload: { appointment_ref: appRef(input), customer_id: customerId, new_start_at: newStartAt },
     execute: async () => {
-      const appointment = await resolveAppointment(input);
-      if (!appointment) return { success: false, error_code: 'NOT_FOUND', message: '预约不存在' };
       if (appointment.customer_id !== customerId) return { success: false, error_code: 'POLICY_DENIED', message: '无权操作该预约' };
       if (appointment.status !== 'confirmed' && appointment.status !== 'pending') return { success: false, error_code: 'INVALID_STATE', message: '当前状态不允许改期' };
 
       const service = await getService(appointment.service_id);
       if (!service) throw new Error('Service not found');
-      const newEndAt = addMinutes(input.new_start_at, service.duration_minutes);
+      const newEndAt = addMinutes(newStartAt, service.duration_minutes);
 
       const client = await pool.connect();
       try {
@@ -314,7 +411,7 @@ export async function rescheduleAppointment(input: RescheduleAppointmentInput) {
              AND status IN ('pending', 'confirmed', 'checked_in')
              AND tstzrange(start_at, end_at, '[)') && tstzrange($3::timestamptz, $4::timestamptz, '[)')
            LIMIT 1`,
-          [appointment.staff_id, appointment.id, input.new_start_at, newEndAt],
+          [appointment.staff_id, appointment.id, newStartAt, newEndAt],
         );
         if ((conflict.rowCount ?? 0) > 0) {
           await client.query('ROLLBACK');
@@ -327,7 +424,7 @@ export async function rescheduleAppointment(input: RescheduleAppointmentInput) {
                updated_at=now()
            WHERE id=$1
            RETURNING *`,
-          [appointment.id, input.new_start_at, newEndAt],
+          [appointment.id, newStartAt, newEndAt],
         );
         const next = toAppointment(updated.rows[0] as Record<string, unknown>);
         await writeAudit({

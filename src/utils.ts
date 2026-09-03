@@ -3,6 +3,43 @@ import type { z } from 'zod';
 
 export const toIso = (value: string | Date) => new Date(value).toISOString();
 
+const TZ_OFFSET = '+08:00';
+
+/**
+ * 数字人口语时间的宽容解析（服务端统一兜底，LLM 不必严格产出 ISO）：
+ *  - "2026-06-17"            → 当天 00:00（东八区）
+ *  - "2026-06-17 15:30"      → 东八区（空格分隔，LLM 常见输出）
+ *  - "2026-06-17T15:30"      → 东八区
+ *  - 带时区 ISO（Z / ±hh:mm）→ 原样解析
+ *  非法输入抛 INVALID_TIME，提示语可直接回给数字人复述。
+ */
+export function normalizeTimestamp(value: string): string {
+  const raw = String(value ?? '').trim();
+  if (!raw) throw new Error('INVALID_TIME: 时间不能为空');
+  if (/Z$/i.test(raw) || /[+-]\d{2}:?\d{2}$/.test(raw)) {
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) throw new Error(`INVALID_TIME: 无法解析时间「${raw}」`);
+    return parsed.toISOString();
+  }
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (!match) {
+    throw new Error(`INVALID_TIME: 无法解析时间「${raw}」，请使用 YYYY-MM-DD 或 YYYY-MM-DD HH:mm`);
+  }
+  const [, year, month, day, hour = '00', minute = '00', second = '00'] = match;
+  const parsed = new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}${TZ_OFFSET}`);
+  if (Number.isNaN(parsed.getTime())) throw new Error(`INVALID_TIME: 无法解析时间「${raw}」`);
+  return parsed.toISOString();
+}
+
+/** 日期参数校验（YYYY-MM-DD），用于按天查询时段。 */
+export function normalizeDate(value: string): string {
+  const raw = String(value ?? '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw new Error(`INVALID_DATE: 无法解析日期「${raw}」，请使用 YYYY-MM-DD`);
+  }
+  return raw;
+}
+
 export const makeAppointmentCode = () => `apt_${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}_${crypto.randomBytes(3).toString('hex')}`;
 
 export const hashIdempotencyKey = (value: string) => crypto.createHash('sha256').update(value).digest('hex');

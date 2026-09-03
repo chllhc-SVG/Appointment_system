@@ -1137,6 +1137,19 @@ body {
   row-gap: 4px;
 }
 
+/* 员工弹窗：超出门店范围警告 */
+.staff-scope-warning {
+  display: block;
+  margin-top: 4px;
+  color: #cf1322;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 6px 10px;
+  background: #fff2f0;
+  border: 1px solid #ffccc7;
+  border-radius: 6px;
+}
+
 /* 门店卡片：可做项目摘要 */
 .store-card-services {
   display: flex;

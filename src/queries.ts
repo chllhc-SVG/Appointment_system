@@ -115,11 +115,31 @@ export async function getService(id: string) {
   return rows[0] ? mapService(rows[0]) : undefined;
 }
 
-/** 按名称模糊匹配服务（数字人直接说"皮肤管理"即可解析），匹配多个时返回第一个。 */
-export async function findServiceByName(name: string) {
+/** 按名称模糊匹配服务（数字人直接说"皮肤管理"即可解析），匹配多个时返回第一个。
+ *  传入 storeId 时限定该店可做范围（store_services，旧数据无勾选时回退"店内在职员工可做项目"），
+ *  避免数字人约到该店未开通的项目。 */
+export async function findServiceByName(name: string, storeId?: string) {
+  const params: unknown[] = [name.trim()];
+  const conditions: string[] = [`s.is_active = true`];
+  if (storeId?.trim()) {
+    params.push(storeId.trim());
+    conditions.push(`(
+      CASE WHEN EXISTS (SELECT 1 FROM store_services ss2 WHERE ss2.store_id = $${params.length})
+        THEN EXISTS (SELECT 1 FROM store_services ss3 WHERE ss3.store_id = $${params.length} AND ss3.service_id = s.id)
+        ELSE EXISTS (
+          SELECT 1 FROM staff_service_skills sk
+          JOIN staff st ON st.id = sk.staff_id
+          WHERE sk.service_id = s.id AND st.store_id = $${params.length} AND st.is_active = true
+        )
+      END
+    )`);
+  }
+  params.push(`%${name.trim()}%`);
   const { rows } = await pool.query(
-    `SELECT * FROM services WHERE is_active = true AND name ILIKE $1 ORDER BY name ASC LIMIT 1`,
-    [`%${name.trim()}%`],
+    `SELECT * FROM services s
+     WHERE ${conditions.join(' AND ')} AND s.name ILIKE $${params.length}
+     ORDER BY s.name ASC LIMIT 1`,
+    params,
   );
   return rows[0] ? mapService(rows[0]) : undefined;
 }
@@ -189,12 +209,31 @@ export async function getAppointmentDetailByCustomer(customerId: string, appoint
   return { appointment, store, staff, service, audits } satisfies AppointmentDetail;
 }
 
-export async function listAppointmentsByCustomer(customerId: string, fromDate?: string, toDate?: string, status?: AppointmentStatus) {
+export async function listAppointmentsByCustomer(
+  customerId: string,
+  fromDate?: string,
+  toDate?: string,
+  status?: AppointmentStatus,
+  serviceName?: string,
+  keyword?: string,
+) {
   const conditions: string[] = ['customer_id = $1'];
   const params: unknown[] = [customerId];
   if (fromDate) { params.push(fromDate); conditions.push(`start_at >= $${params.length}`); }
   if (toDate) { params.push(toDate); conditions.push(`start_at <= $${params.length}`); }
   if (status) { params.push(status); conditions.push(`status = $${params.length}`); }
+  if (serviceName?.trim()) {
+    params.push(`%${serviceName.trim()}%`);
+    conditions.push(`EXISTS (SELECT 1 FROM services sv WHERE sv.id = appointments.service_id AND sv.name ILIKE $${params.length})`);
+  }
+  if (keyword?.trim()) {
+    params.push(`%${keyword.trim()}%`);
+    conditions.push(`(
+      appointment_code ILIKE $${params.length}
+      OR EXISTS (SELECT 1 FROM services sv2 WHERE sv2.id = appointments.service_id AND sv2.name ILIKE $${params.length})
+      OR EXISTS (SELECT 1 FROM staff sf WHERE sf.id = appointments.staff_id AND sf.name ILIKE $${params.length})
+    )`);
+  }
   const { rows } = await pool.query(`SELECT * FROM appointments WHERE ${conditions.join(' AND ')} ORDER BY start_at DESC`, params);
   return rows.map(mapAppointment);
 }
@@ -203,6 +242,7 @@ export async function listAppointmentsByFilters(input: {
   store_id?: string;
   staff_id?: string;
   service_id?: string;
+  service_name?: string;
   from_date?: string;
   to_date?: string;
   status?: AppointmentStatus;
@@ -215,10 +255,11 @@ export async function listAppointmentsByFilters(input: {
   if (input.store_id?.trim()) { params.push(input.store_id.trim()); conditions.push(`a.store_id = $${params.length}`); }
   if (input.staff_id?.trim()) { params.push(input.staff_id.trim()); conditions.push(`a.staff_id = $${params.length}`); }
   if (input.service_id?.trim()) { params.push(input.service_id.trim()); conditions.push(`a.service_id = $${params.length}`); }
+  if (input.service_name?.trim()) { params.push(`%${input.service_name.trim()}%`); conditions.push(`sv.name ILIKE $${params.length}`); }
   if (input.from_date?.trim()) { params.push(input.from_date.trim()); conditions.push(`a.start_at >= $${params.length}`); }
   if (input.to_date?.trim()) { params.push(input.to_date.trim()); conditions.push(`a.start_at <= $${params.length}`); }
   if (input.status) { params.push(input.status); conditions.push(`a.status = $${params.length}`); }
-  if (input.keyword?.trim()) { params.push(`%${input.keyword.trim()}%`); conditions.push(`(a.customer_name ILIKE $${params.length} OR a.customer_phone ILIKE $${params.length} OR a.appointment_code ILIKE $${params.length})`); }
+  if (input.keyword?.trim()) { params.push(`%${input.keyword.trim()}%`); conditions.push(`(a.customer_name ILIKE $${params.length} OR a.customer_phone ILIKE $${params.length} OR a.appointment_code ILIKE $${params.length} OR sv.name ILIKE $${params.length} OR s.name ILIKE $${params.length})`); }
   const limit = toPagination(input.limit ?? 20);
   const offset = Math.max(0, Number(input.offset ?? 0));
   params.push(limit, offset);

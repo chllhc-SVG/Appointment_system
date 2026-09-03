@@ -42,15 +42,16 @@ services:
       - "4020:4020"
     restart: unless-stopped
     labels:
-      - "mcp.enabled=true"
-      - "mcp.namespace=appointment_service"
-      - "mcp.name=预约排班系统"
-      - "mcp.transport=streamable_http"
-      - "mcp.url=http://appointment-service:4020/mcp"
-      - "mcp.path=/mcp"
-      - "mcp.healthPath=/healthz"
-      - "mcp.port=4020"
-      - "mcp.include_tools=search_available_slots,create_appointment,get_my_appointments,get_appointment_detail,cancel_appointment,reschedule_appointment,list_booking_reference_data,list_store_services,list_store_staff,list_staff_availability,list_appointments,get_appointment_overview,list_appointment_audits,confirm_appointment,check_in_appointment,complete_appointment,mark_no_show_appointment"
+      # MCP 自动发现约定：客户端不再内置服务，全部由 compose labels 声明
+      mcp.enabled: "true"
+      mcp.path: "/mcp"
+      mcp.namespace: "appointment_service"
+      mcp.displayName: "预约排班系统"
+      mcp.port: "4020"
+      mcp.healthPath: "/healthz"
+      mcp.transport: "streamable_http"
+      mcp.url: "http://appointment-service:4020/mcp"
+      mcp.include_tools: "search_available_slots,create_appointment,get_my_appointments,get_appointment_detail,cancel_appointment,reschedule_appointment,list_booking_reference_data,list_store_services,list_store_staff,list_staff_availability,list_appointments,get_appointment_overview,list_appointment_audits,confirm_appointment,check_in_appointment,complete_appointment,mark_no_show_appointment"
 
   web:
     build:

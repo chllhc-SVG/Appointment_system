@@ -250,60 +250,68 @@ export function ReferencesView() {
     }));
   }, [stores, staffStoreId, kbBookableServices]);
 
+  // 超出门店范围的已选项目单独分组并置灰（不可再选，但标签仍可删除）
   const staffServiceOptionsWithSelected = useMemo(() => {
     const selectedIds = new Set(staffSelectedServiceIds);
     const flattenedIds = new Set<string>();
     for (const group of staffServiceOptions) {
       for (const item of group.options ?? []) flattenedIds.add(String(item.value));
     }
-    const missing: ServiceWithStats[] = [];
+    const outOfScope: ServiceWithStats[] = [];
     for (const id of selectedIds) {
       const service = serviceNameById.get(id);
-      if (service && !flattenedIds.has(service.id)) missing.push(service);
+      if (service && !flattenedIds.has(service.id)) outOfScope.push(service);
     }
-    if (missing.length === 0) return staffServiceOptions;
+    if (outOfScope.length === 0) return staffServiceOptions;
     return [
-      {
-        label: '已选项目',
-        options: missing.map((service) => ({ value: service.id, label: service.name })),
-      },
       ...staffServiceOptions,
+      {
+        label: '超出门店范围（不可选）',
+        options: outOfScope.map((service) => ({
+          value: service.id,
+          label: service.name,
+          disabled: true,
+        })),
+      },
     ];
   }, [staffServiceOptions, serviceNameById, staffSelectedServiceIds]);
 
-  // 员工技能强制收敛：
-  // 1) 移除已不存在的项目（无法解析名称 → 之前显示为 UUID 的来源）
-  // 2) 仅保留所属门店可做范围内的项目（含门店切换、存量数据）
-  const staffAllowedServiceIds = useMemo(() => {
-    const store = stores.find((s) => s.id === staffStoreId);
+  // 门店切换时自动收敛：仅保留新门店可做范围内的项目（含切换、存量数据）
+  const handleStaffStoreChange = useCallback((value: string) => {
+    setStaffStoreId(value);
+    const store = stores.find((s) => s.id === value);
     const allowedIds = new Set(store?.service_ids ?? []);
-    if (!store || allowedIds.size === 0) return null; // 门店未配置时不干预（兼容旧数据）
-    return allowedIds;
-  }, [stores, staffStoreId]);
+    if (!store || allowedIds.size === 0) return;
+    const pruned = staffSelectedServiceIds.filter((id) => allowedIds.has(id));
+    const removed = staffSelectedServiceIds.filter((id) => !allowedIds.has(id));
+    if (removed.length > 0) {
+      const labels = removed.map((id) => serviceNameById.get(id)?.name ?? id).join('、');
+      setStaffSelectedServiceIds(pruned);
+      staffForm.setFieldValue('service_ids', pruned);
+      message.warning(`已移除不属于「${store.name}」可做范围的项目：${labels}`);
+    }
+  }, [stores, staffSelectedServiceIds, staffForm, serviceNameById]);
 
+  // 清理已不存在的项目（无法解析名称 → 之前显示为 UUID 的来源）
   useEffect(() => {
     const resolvable = staffSelectedServiceIds.filter((id) => serviceNameById.has(id));
     const removedUnknown = staffSelectedServiceIds.length - resolvable.length;
-    let next = resolvable;
-
-    const allowed = staffAllowedServiceIds;
-    if (allowed) {
-      const pruned = next.filter((id) => allowed.has(id));
-      const removedOutOfScope = next.length - pruned.length;
-      next = pruned;
-      if (removedUnknown + removedOutOfScope > 0) {
-        setStaffSelectedServiceIds(next);
-        staffForm.setFieldValue('service_ids', next);
-        message.info(`已移除 ${removedUnknown + removedOutOfScope} 个无效或该门店不支持的项目`);
-      }
-      return;
-    }
     if (removedUnknown > 0) {
-      setStaffSelectedServiceIds(next);
-      staffForm.setFieldValue('service_ids', next);
+      setStaffSelectedServiceIds(resolvable);
+      staffForm.setFieldValue('service_ids', resolvable);
       message.info(`已移除 ${removedUnknown} 个已不存在的项目`);
     }
-  }, [staffSelectedServiceIds, staffAllowedServiceIds, staffForm, serviceNameById]);
+  }, [staffSelectedServiceIds, staffForm, serviceNameById]);
+
+  // 计算超出门店范围的项目（用于提示）
+  const outOfScopeServiceNames = useMemo(() => {
+    const store = stores.find((s) => s.id === staffStoreId);
+    const allowedIds = new Set(store?.service_ids ?? []);
+    if (!store || allowedIds.size === 0) return null;
+    const out = staffSelectedServiceIds.filter((id) => !allowedIds.has(id) && serviceNameById.has(id));
+    if (out.length === 0) return null;
+    return out.map((id) => serviceNameById.get(id)!.name).join('、');
+  }, [stores, staffStoreId, staffSelectedServiceIds, serviceNameById]);
 
   const storeServiceCount = useMemo(() => {
     const map = new Map<string, number>();
@@ -463,6 +471,10 @@ export function ReferencesView() {
   const submitStaff = async () => {
     const values = await staffForm.validateFields();
     const body = { ...values, service_ids: staffSelectedServiceIds };
+    if (outOfScopeServiceNames) {
+      message.error(`员工可服务项目必须属于所属门店可做范围：${outOfScopeServiceNames}`);
+      return;
+    }
     try {
       if (staffModal.editing) {
         const res = await api.updateStaff(staffModal.editing.id, body);
@@ -876,10 +888,14 @@ export function ReferencesView() {
             <Select
               placeholder="选择门店"
               options={stores.map((store) => ({ value: store.id, label: store.name }))}
-              onChange={(value: string) => setStaffStoreId(value)}
+              onChange={(value: string) => handleStaffStoreChange(value)}
             />
           </Form.Item>
-          <Form.Item name="service_ids" label="可服务项目">
+          <Form.Item
+            name="service_ids"
+            label="可服务项目"
+            extra={outOfScopeServiceNames ? <span className="staff-scope-warning">超出所属门店可做范围，保存前请移除：{outOfScopeServiceNames}</span> : undefined}
+          >
             <Select
               mode="multiple"
               placeholder="选择该员工可服务的项目（多选）"

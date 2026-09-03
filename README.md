@@ -22,7 +22,8 @@
 - `list_store_services` 查询门店项目
 - `list_store_staff` 查询门店员工
 - `list_staff_availability` 查询员工排班
-- `get_appointment_timeline` 查询预约审计轨迹
+- `list_appointment_audits` 查询预约审计轨迹
+- `confirm_appointment` 确认预约（员工/管理端）
 - `check_in_appointment` 到店签到
 - `complete_appointment` 完成预约
 - `mark_no_show_appointment` 标记爽约
@@ -106,6 +107,27 @@ docker compose up -d --build
 - `4020`：预约服务 + HTTP MCP
 - `5434`：PostgreSQL（宿主机映射）
 
+### 数字人客户端本地化接入（Docker MCP 自动发现）
+
+本仓库的 `docker-compose.yml` 已按「compose labels 自动发现约定」声明 MCP 服务，
+数字人桌面客户端（Electron）启动时会扫描同级目录下的 compose 项目并自动拉起，
+无需手动 `docker compose up`。已声明的 labels：
+
+| label | 值 | 说明 |
+|---|---|---|
+| `mcp.enabled` | `"true"` | 自动发现且随客户端启动 |
+| `mcp.path` | `/mcp` | MCP 端点路径 |
+| `mcp.namespace` | `appointment_service` | 平台 namespace / server_id |
+| `mcp.displayName` | `预约排班系统` | 客户端 UI 展示名 |
+| `mcp.port` | `4020` | host 端口 |
+| `mcp.healthPath` | `/healthz` | 健康检查路径 |
+| `mcp.include_tools` | 17 个工具名 | 平台侧白名单参考 |
+
+客户端发现后的运行地址为 `http://<本机局域网IP>:4020/mcp`（compose 端口映射绑定 0.0.0.0）。
+在 MCP 平台中将「预约排班系统」的连接方式改为本地化（`transport: "client"` + `localizeEnabled`）
+即可让数字人经本地转发层调用本机 Docker 里的预约服务；平台下发的
+`desired-local-services` 也会按上述 compose 定义自动 `docker compose up`。
+
 ---
 
 ## 环境变量
@@ -165,13 +187,26 @@ pnpm run seed
     "list_store_services",
     "list_store_staff",
     "list_staff_availability",
-    "get_appointment_timeline",
+    "list_appointments",
+    "get_appointment_overview",
+    "list_appointment_audits",
+    "confirm_appointment",
     "check_in_appointment",
     "complete_appointment",
     "mark_no_show_appointment"
   ]
 }
 ```
+
+## 数字人自然语言 → 工具调用速查
+
+| 用户话术 | 推荐工具 |
+|---|---|
+| “查看我（最近/某天/某个项目）的预约” | `get_my_appointments`（按 `service_name` / `status` / 日期过滤） |
+| “这个预约详情 / 预约码是 xxx” | `get_appointment_detail` |
+| “我想预约小气泡 / 皮肤管理” | `list_booking_reference_data` → `search_available_slots` → **确认后** `create_appointment` |
+| “取消这个预约 / 退掉小气泡” | `cancel_appointment`（支持预约码或 项目+日期 自动定位） |
+| “改到明天上午 / 换个时间” | `reschedule_appointment`（`new_start_at` + 预约码 或 项目+日期） |
 
 ---
 
