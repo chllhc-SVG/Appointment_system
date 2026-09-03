@@ -1,0 +1,68 @@
+name: appointment-mcp-system
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: appointment-mcp-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: appointment_mcp
+    ports:
+      - "5434:5432"
+    volumes:
+      - appointment_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appointment_mcp"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  appointment-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: appointment-mcp-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/appointment_mcp
+      MCP_SERVER_NAME: appointment-mcp
+      MCP_SERVER_VERSION: 1.0.0
+      MCP_HTTP_PORT: 4020
+      TZ: Asia/Shanghai
+      MCP_MODE: http
+      # ADMIN_TOKEN: replace-me
+      # 知识库项目管理同步源（GET /api/kb/projects，Bearer 鉴权）
+      KNOWLEDGE_BASE_URL: ${KNOWLEDGE_BASE_URL:-http://host.docker.internal:3001}
+      KNOWLEDGE_BASE_ADMIN_TOKEN: ${KNOWLEDGE_BASE_ADMIN_TOKEN:-dev-admin-token}
+    ports:
+      - "4020:4020"
+    restart: unless-stopped
+    labels:
+      - "mcp.enabled=true"
+      - "mcp.namespace=appointment_service"
+      - "mcp.name=预约排班系统"
+      - "mcp.transport=streamable_http"
+      - "mcp.url=http://appointment-service:4020/mcp"
+      - "mcp.path=/mcp"
+      - "mcp.healthPath=/healthz"
+      - "mcp.port=4020"
+      - "mcp.include_tools=search_available_slots,create_appointment,get_my_appointments,get_appointment_detail,cancel_appointment,reschedule_appointment,list_booking_reference_data,list_store_services,list_store_staff,list_staff_availability,list_appointments,get_appointment_overview,list_appointment_audits,confirm_appointment,check_in_appointment,complete_appointment,mark_no_show_appointment"
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: appointment-mcp-web
+    depends_on:
+      appointment-service:
+        condition: service_started
+    ports:
+      - "5180:80"
+    restart: unless-stopped
+
+volumes:
+  appointment_postgres_data:

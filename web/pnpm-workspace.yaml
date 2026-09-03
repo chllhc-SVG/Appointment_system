@@ -1,0 +1,5 @@
+packages: []
+# 供应链策略：容忍新发布版本的依赖（本服务为内部业务系统）
+minimumReleaseAge: 0
+# 允许依赖 postinstall 脚本（esbuild 需要下载平台二进制）
+dangerouslyAllowAllBuilds: true
