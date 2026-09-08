@@ -85,6 +85,11 @@ export interface StaffSchedule {
   updated_at: string;
 }
 
+/** 门店维度的排班视图（含员工名），供管理后台日历展示 */
+export interface StaffScheduleWithStaff extends StaffSchedule {
+  staff_name: string;
+}
+
 export interface Appointment {
   id: string;
   appointment_code: string;
@@ -127,13 +132,20 @@ export interface TimeSlot {
   staff_name: string;
   start_at: string;
   end_at: string;
+  /** 东八区本地时间（YYYY-MM-DD HH:mm），供数字人直接向用户口播，避免把 UTC 误读成凌晨 */
+  start_local: string;
+  end_local: string;
 }
 
 export interface CreateAppointmentInput {
-  service_id: string;
-  store_id: string;
-  staff_id: string;
-  start_at: string;
+  service_id?: string;
+  store_id?: string;
+  staff_id?: string;
+  /** 门店名（用户直接说门店名时传，服务端模糊解析） */
+  store_name?: string;
+  /** 员工名（用户指定员工时传，服务端在门店内按名字解析） */
+  staff_name?: string;
+  start_at?: string;
   customer_name?: string;
   customer_phone?: string;
   customer_id?: string;
@@ -147,8 +159,12 @@ export interface SearchSlotsInput {
   service_id?: string;
   service_name?: string;
   store_id?: string;
+  /** 门店名（数字人用户直接说"上海徐汇门店"时传，服务端模糊解析） */
+  store_name?: string;
   date: string;
   preferred_staff_id?: string;
+  /** 指定员工名（如"李美容师"），与 preferred_staff_id 二选一 */
+  preferred_staff_name?: string;
 }
 
 export interface RescheduleAppointmentInput {
@@ -221,6 +237,35 @@ export interface ListStaffSchedulesInput {
   staff_id: string;
   date_from: string;
   date_to: string;
+}
+
+/** 门店维度排班查询（管理后台日历用） */
+export interface ListStoreSchedulesInput {
+  store_id: string;
+  date_from: string;
+  date_to: string;
+  /** 可选：只看某个员工 */
+  staff_id?: string;
+}
+
+/** 按天建/改排班：一天一个或多个班次（早晚班），以日期+门店+员工定位 */
+export interface UpsertDaySchedulesInput {
+  store_id: string;
+  staff_id: string;
+  date: string;
+  /** 该天的班次列表（本地时区 HH:mm），如 [{start:"09:00",end:"12:00"},{start:"13:00",end:"18:00"}] */
+  shifts: Array<{ start: string; end: string; status?: ScheduleStatus }>;
+  operator?: string;
+}
+
+/** 按天删除排班：删除该员工该天的全部（或指定开始时间）班次 */
+export interface DeleteDaySchedulesInput {
+  store_id: string;
+  staff_id: string;
+  date: string;
+  /** 省略则删除该天全部班次；传 "09:00" 则只删匹配班次 */
+  start?: string;
+  operator?: string;
 }
 
 export interface ListAppointmentAuditsInput {

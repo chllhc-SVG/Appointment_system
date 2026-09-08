@@ -1,15 +1,44 @@
 /**
- * 调用方身份解析，对齐 knowledge-platform 的 mcpHttp.controller 模式：
- *   1) HTTP 头 X-Agent-Code（数字人客户端 localMcpForwarder / 基座转发层注入，最可信）
- *   2) Authorization: Bearer <JWT> 的 sub 字段（数字人登录令牌，取 sub 作为 agent_code）
- *   3) 都缺失 → 匿名（管理端或直连调试场景）
- * 解析出的身份会作为 verifiedAgentCode 注入工具执行上下文，
- * 写操作（创建/取消/改期/签到）强制使用该身份，防止 LLM 伪造他人身份越权。
+ * 双层身份模型：
+ *   agent（数字人终端）身份 —— X-Agent-Code / Bearer sub，表示"哪台数字人在说话"；
+ *   customer（真实顾客）身份 —— 顾客通过 manage_customer_session(action=identify, customer_phone=...) 建立的会话绑定，
+ *                               表示"当前正在被服务的人是谁"。
+ *
+ * 两种运行模式（IDENTITY_MODE）：
+ *   - personal（默认）：数字人账号即顾客本人账号（一人一数字人），行为与旧版一致，
+ *     agent 身份直接作为 customer_id。
+ *   - shared：共享终端模式（如一楼门店公共数字人 hsh 依次接待多位顾客），
+ *     customer_id 必须来自顾客会话；未识别时，顾客级工具返回 IDENTITY_REQUIRED，
+ *     由数字人引导顾客完成识别，杜绝把 A 顾客的预约暴露/操作在 B 顾客名下的串号风险。
+ *
+ * 顾客会话的两个建立来源（shared 模式）：
+ *   1) 对话内 manage_customer_session(action=identify, customer_phone=...)（手机号口头提供，source=manual）；
+ *   2) 客户端转发层直通注入 X-Customer-Phone / X-Customer-Name
+ *      （小程序扫码已确认的顾客身份，source=scan，自动建绑，无需口头再问）。
+ *
+ * HTTP 头 X-Session-Id（外部会话作用域）：客户端在每次对话会话启动时生成，
+ * 同一台数字人并行多路对话时各会话各自绑定顾客，互不串号；单终端顺序接待可不传。
  */
+
+export type IdentityMode = 'personal' | 'shared';
 
 export interface ParsedIdentity {
   agentCode?: string;
+  sessionId?: string;
+  /** 扫码直通的顾客手机号（客户端转发层注入，表示"小程序已确认的顾客"） */
+  customerPhone?: string;
+  customerName?: string;
   source: 'header' | 'bearer' | 'none';
+}
+
+export interface BoundIdentity {
+  /** 已解析的最终顾客身份。shared 模式下可能为 undefined（未识别），由工具层决定报错。 */
+  customerId?: string;
+  agentCode?: string;
+  sessionId?: string;
+  /** shared 模式且顾客未识别时为 true，工具层应返回引导文案。 */
+  needsIdentification: boolean;
+  mode: IdentityMode;
 }
 
 const readAuthHeader = (req: { headers?: Record<string, string | string[] | undefined> }): string | undefined => {
@@ -31,34 +60,96 @@ const decodeJwtSub = (token: string): string | undefined => {
   }
 };
 
+const firstHeader = (value: string | string[] | undefined): string | undefined => {
+  const v = Array.isArray(value) ? value[0] : value;
+  const trimmed = v?.trim();
+  return trimmed || undefined;
+};
+
+/** 头部值兼容处理：客户端对非 ASCII（如中文称呼）做 encodeURIComponent，服务端解码还原；解码失败原样返回。 */
+const decodeHeader = (value: string | undefined): string | undefined => {
+  if (!value) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
+
 export function parseIdentity(req: { headers?: Record<string, string | string[] | undefined> }): ParsedIdentity {
   const rawHeaders = req.headers ?? {};
-  const headerCode = rawHeaders['x-agent-code'] ?? rawHeaders['X-Agent-Code'];
-  const headerValue = Array.isArray(headerCode) ? headerCode[0] : headerCode;
-  const trimmed = headerValue?.trim();
 
-  if (trimmed) {
-    return { agentCode: trimmed, source: 'header' };
+  const agentCode = firstHeader(rawHeaders['x-agent-code'] ?? rawHeaders['X-Agent-Code']);
+  if (agentCode) {
+    return {
+      agentCode,
+      sessionId: firstHeader(rawHeaders['x-session-id'] ?? rawHeaders['X-Session-Id']),
+      customerPhone: decodeHeader(firstHeader(rawHeaders['x-customer-phone'] ?? rawHeaders['X-Customer-Phone'])),
+      customerName: decodeHeader(firstHeader(rawHeaders['x-customer-name'] ?? rawHeaders['X-Customer-Name'])),
+      source: 'header',
+    };
   }
 
   const auth = readAuthHeader(req)?.trim();
   if (auth?.toLowerCase().startsWith('bearer ')) {
     const sub = decodeJwtSub(auth.slice(7).trim());
-    if (sub) return { agentCode: sub, source: 'bearer' };
+    if (sub) {
+      return {
+        agentCode: sub,
+        sessionId: firstHeader(rawHeaders['x-session-id']),
+        customerPhone: decodeHeader(firstHeader(rawHeaders['x-customer-phone'])),
+        customerName: decodeHeader(firstHeader(rawHeaders['x-customer-name'])),
+        source: 'bearer',
+      };
+    }
   }
 
-  return { agentCode: undefined, source: 'none' };
+  return {
+    sessionId: firstHeader(rawHeaders['x-session-id']),
+    customerPhone: decodeHeader(firstHeader(rawHeaders['x-customer-phone'])),
+    customerName: decodeHeader(firstHeader(rawHeaders['x-customer-name'])),
+    source: 'none',
+  };
 }
 
-/** 写操作工具：身份非空时强制覆盖 customer_id，匿名时允许显式传参（管理端调试）。 */
-export function bindIdentity<T extends Record<string, unknown>>(
-  input: T,
-  identity: { agentCode?: string },
-): T {
+/**
+ * 顾客级工具（查询/创建/取消/改期/签到本人预约、顾客身份管理）的上下文解析。
+ * 返回 needsIdentification=true 时工具层直接返回引导文案（fail-closed）。
+ */
+export async function bindCustomerIdentity(
+  input: Record<string, unknown>,
+  identity: { agentCode?: string; sessionId?: string; customerPhone?: string; customerName?: string },
+  resolveSessionCustomer: (agentCode: string, sessionId?: string) => Promise<{ customerId?: string } | null>,
+): Promise<BoundIdentity> {
+  const mode: IdentityMode = (process.env.IDENTITY_MODE?.trim().toLowerCase() as IdentityMode) || 'personal';
+
+  // 身份管理工具与匿名/管理端调试：允许显式参数直通
+  if (!identity.agentCode) {
+    return {
+      customerId: typeof input.customer_id === 'string' && input.customer_id.trim() ? input.customer_id.trim() : undefined,
+      agentCode: undefined,
+      sessionId: identity.sessionId,
+      needsIdentification: false,
+      mode,
+    };
+  }
+
+  if (mode === 'personal') {
+    return { customerId: identity.agentCode, agentCode: identity.agentCode, sessionId: identity.sessionId, needsIdentification: false, mode };
+  }
+
+  // shared 模式：顾客身份只来自顾客会话，不信任 LLM 传入的 customer_id
+  const session = await resolveSessionCustomer(identity.agentCode, identity.sessionId);
+  if (!session?.customerId) {
+    return { customerId: undefined, agentCode: identity.agentCode, sessionId: identity.sessionId, needsIdentification: true, mode };
+  }
+  return { customerId: session.customerId, agentCode: identity.agentCode, sessionId: identity.sessionId, needsIdentification: false, mode };
+}
+
+/** 非顾客级工具（参考数据、管理端操作等）：仅注入 agent 语义（operator），不改写 customer_id。 */
+export function bindAgentContext<T extends Record<string, unknown>>(input: T, identity: { agentCode?: string }): T {
   if (!identity.agentCode) return input;
-  const next = { ...input } as T & { customer_id?: unknown };
-  // 无条件绑定：数字人身份即客户身份。对不消费 customer_id 的工具，
-  // zod 默认 strip 未知字段，不会造成影响。
-  next.customer_id = identity.agentCode;
+  const next = { ...input } as T & { agent_code?: unknown };
+  next.agent_code = identity.agentCode;
   return next as T;
 }

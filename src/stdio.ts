@@ -1,5 +1,6 @@
 import { appointmentTools } from './tools/tools.js';
-import { bindIdentity } from './identity.js';
+import { bindCustomerIdentity } from './identity.js';
+import { getActiveSession } from './services/customer-identity.js';
 import { toMcpToolDefinition, wrapToolError } from './utils.js';
 import { wrapToolCall } from './services/mcp-call-log.js';
 import type { z } from 'zod';
@@ -7,7 +8,22 @@ import type { z } from 'zod';
 /**
  * stdio 模式 MCP 传输（Content-Length 帧协议），
  * 与 @modelcontextprotocol/sdk 的 stdio 客户端兼容，供本地数字人进程直接拉起。
+ * 身份模型与 HTTP 模式一致：personal=agent 即顾客；shared=顾客来自 manage_customer_session(action=identify) 会话。
  */
+
+const CUSTOMER_SCOPED_TOOLS = new Set([
+  'query_slots',
+  'query_bookings',
+  'manage_booking',
+]);
+
+const CUSTOMER_ACTIONS = new Set(['create', 'cancel', 'reschedule', 'check_in']);
+
+const IDENTITY_REQUIRED_RESULT = {
+  success: false,
+  error_code: 'IDENTITY_REQUIRED',
+  message: '当前是共享数字人终端，尚未识别顾客身份。请先调用 manage_customer_session(action=identify, customer_phone=...) 完成识别。',
+};
 
 type JsonRpcId = string | number | null;
 
@@ -67,13 +83,23 @@ export function startMcpStdio(opts?: { verifiedAgentCode?: string; tools?: typeo
       if (!tool) return jsonRpcError(id, -32601, `Tool not found: ${toolName}`);
       const args = (params.arguments && typeof params.arguments === 'object' ? params.arguments : {}) as Record<string, unknown>;
       try {
-        const bound = bindIdentity(args, { agentCode: verifiedAgentCode });
+        let executeArgs: Record<string, unknown> = args;
+        const customerScoped = CUSTOMER_SCOPED_TOOLS.has(toolName) && (toolName !== 'manage_booking' || (typeof args.action === 'string' && CUSTOMER_ACTIONS.has(args.action)));
+        if (customerScoped) {
+          const bound = await bindCustomerIdentity(args, { agentCode: verifiedAgentCode }, (agentCode) =>
+            getActiveSession(agentCode).then((s) => (s ? { customerId: s.customer_id } : null)),
+          );
+          if (bound.needsIdentification) return jsonRpcResult(id, IDENTITY_REQUIRED_RESULT);
+          executeArgs = { ...args, customer_id: bound.customerId, agent_code: verifiedAgentCode };
+        } else if (verifiedAgentCode) {
+          executeArgs = { ...args, agent_code: verifiedAgentCode };
+        }
         const result = await wrapToolCall({
           transport: 'stdio',
           agentCode: verifiedAgentCode,
           toolName,
           args,
-          execute: () => tool.handler(bound as never),
+          execute: () => tool.handler(executeArgs as never),
         });
         return jsonRpcResult(id, result);
       } catch (error) {

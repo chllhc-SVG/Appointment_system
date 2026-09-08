@@ -1,7 +1,7 @@
 import { pool } from '../db/pool.js';
 import { writeAudit } from '../audit.js';
 import { withIdempotentOperation } from '../idempotency.js';
-import { addMinutes, assertNonEmpty, hashIdempotencyKey, makeAppointmentCode, normalizeDate, normalizeTimestamp } from '../utils.js';
+import { addMinutes, assertNonEmpty, formatBeijing, hashIdempotencyKey, makeAppointmentCode, normalizeDate, normalizeTimestamp } from '../utils.js';
 import type {
   Appointment,
   AppointmentStatus,
@@ -14,15 +14,19 @@ import type {
 } from '../types.js';
 import {
   countAppointmentOverview,
+  computeAvailableSlots,
   findServiceByName,
+  findStoreByName,
   getAppointment,
   getAppointmentByCode,
   getAppointmentDetailByCustomer,
   getService,
   getStaff,
   getStore,
+  isWithinAvailableSchedule,
   listAppointmentsByCustomer,
   listAppointmentsByFilters,
+  listAvailableScheduleDates,
   listBusyAppointments,
   listStaffSkillsForService,
   listServices,
@@ -31,6 +35,7 @@ import {
   listStaffSchedules,
   searchAvailableTimeSlots,
 } from '../queries.js';
+import { deleteDaySchedules, listStoreSchedules, upsertDaySchedules, applyWeeklyScheduleTemplate } from './catalog.js';
 
 const toAppointment = (row: Record<string, unknown>): Appointment => row as unknown as Appointment;
 
@@ -62,6 +67,21 @@ const resolveService = async (input: { service_id?: string; service_name?: strin
   if (input.service_id?.trim()) return getService(input.service_id.trim());
   if (input.service_name?.trim()) return findServiceByName(input.service_name, input.store_id?.trim());
   return undefined;
+};
+
+/** 用户直接说门店名（"上海徐汇门店"）→ 门店 id 解析；找不到抛业务错误结构 */
+const resolveStoreOrError = async (input: { store_id?: string; store_name?: string }) => {
+  if (input.store_id?.trim()) {
+    const store = await getStore(input.store_id.trim());
+    if (!store) return { store: undefined, error: { success: false as const, error_code: 'STORE_NOT_FOUND', message: '门店不存在或已停用' } };
+    return { store, error: null };
+  }
+  if (input.store_name?.trim()) {
+    const store = await findStoreByName(input.store_name.trim());
+    if (!store) return { store: undefined, error: { success: false as const, error_code: 'STORE_NOT_FOUND', message: `未找到名称包含「${input.store_name.trim()}」的门店，可先调用 list_booking_reference 查门店列表` } };
+    return { store, error: null };
+  }
+  return { store: undefined, error: null };
 };
 
 /** 预约定位：优先 appointment_id，其次 appointment_code（数字人对话中常拿到预约码）。 */
@@ -103,7 +123,7 @@ async function resolveAppointmentForCustomer(
   if (locator.service_id?.trim()) filtered = filtered.filter((item) => item.service_id === locator.service_id);
   if (locator.status) filtered = filtered.filter((item) => item.status === locator.status);
   if (filtered.length === 0) {
-    return { ok: false, error_code: 'NOT_FOUND', message: '未找到匹配的预约，请用 get_my_appointments 确认预约记录' };
+    return { ok: false, error_code: 'NOT_FOUND', message: '未找到匹配的预约，请用 query_bookings(scope=my) 确认预约记录' };
   }
   if (filtered.length > 1) {
     return {
@@ -140,12 +160,16 @@ function assertCustomerIdentity(customerId: string | undefined) {
 }
 
 export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
-  | { success: true; service: { id: string; name: string; duration_minutes: number }; slots: TimeSlot[] }
+  | { success: true; service: { id: string; name: string; duration_minutes: number }; store?: { id: string; name: string }; slots: TimeSlot[]; has_slots: boolean; suggestion?: { reason: string; message: string; dates?: string[] } }
   | { success: false; error_code: string; message: string }
 > {
   assertNonEmpty(input.date, 'date');
   const date = normalizeDate(input.date);
-  const service = await resolveService(input);
+  // 先解析门店（支持门店名），再在门店范围内解析项目，保证"门店有这个项目"的链路顺序
+  const { store, error: storeError } = await resolveStoreOrError(input);
+  if (storeError) return storeError;
+  const storeId = store?.id ?? input.store_id?.trim();
+  const service = await resolveService({ ...input, store_id: storeId });
   const bookable = bookableCheck(service);
   if (!bookable.ok) {
     return { success: false, error_code: bookable.error_code, message: bookable.message };
@@ -154,30 +178,109 @@ export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
     return { success: false, error_code: 'NOT_FOUND', message: 'service not found（可按 service_id 或 service_name 查询）' };
   }
 
-  if (input.store_id?.trim()) {
-    const store = await getStore(input.store_id.trim());
-    if (!store) return { success: false, error_code: 'STORE_NOT_FOUND', message: '门店不存在或已停用' };
+  if (store) {
     const scopeError = await checkServiceInStoreScope(store, service);
     if (scopeError) return scopeError;
   }
 
-  const slots = await searchAvailableTimeSlots(service.id, input.store_id, date, input.preferred_staff_id);
+  // 支持按员工名指定（"想让李美容师服务"）
+  let preferredStaffId = input.preferred_staff_id?.trim();
+  if (!preferredStaffId && input.preferred_staff_name?.trim()) {
+    const staffList = await listStaffSkillsForService(service.id, storeId);
+    const matched = staffList.find((staff) => staff.name === input.preferred_staff_name?.trim())
+      ?? staffList.find((staff) => staff.name.includes(input.preferred_staff_name!.trim()));
+    if (!matched) {
+      return { success: false, error_code: 'STAFF_NOT_FOUND', message: `该门店没有名为「${input.preferred_staff_name.trim()}」且会做「${service.name}」的员工` };
+    }
+    preferredStaffId = matched.id;
+  }
+
+  const slots = await searchAvailableTimeSlots(service.id, storeId, date, preferredStaffId);
+  let reason = 'NO_AVAILABLE_SLOTS';
+  let suggestionDates: string[] | undefined;
+  if (slots.length === 0) {
+    // 区分"没排班"与"排班已满"，帮数字人给出不同的追问话术
+    const skilledStaff = await listStaffSkillsForService(service.id, storeId);
+    const targetStaff = preferredStaffId
+      ? skilledStaff.filter((item) => item.id === preferredStaffId)
+      : skilledStaff;
+    const anyScheduled = targetStaff.length > 0 &&
+      (await Promise.all(targetStaff.map(async (staff) => {
+        const schedules = await listStaffSchedules(staff.id, `${date}T00:00:00+08:00`, `${date}T23:59:59+08:00`);
+        return schedules.filter((schedule) => schedule.status === 'available').length > 0;
+      }))).some(Boolean);
+    if (targetStaff.length === 0) {
+      reason = 'NO_SKILLED_STAFF';
+    } else if (!anyScheduled) {
+      reason = 'NO_SCHEDULE';
+      // 该日期没人排班时，查未来 14 天内有哪些天已排班，数字人可直接建议
+      suggestionDates = await listAvailableScheduleDates(
+        targetStaff.map((staff) => staff.id),
+        date,
+        dayjsAddDays(date, 14),
+      );
+    }
+  }
   return {
     success: true,
     service: { id: service.id, name: service.name, duration_minutes: service.duration_minutes },
+    ...(store ? { store: { id: store.id, name: store.name } } : {}),
     slots,
+    has_slots: slots.length > 0,
+    suggestion: slots.length > 0
+      ? undefined
+      : {
+          reason,
+          ...(suggestionDates && suggestionDates.length > 0 ? { dates: suggestionDates } : {}),
+          message: reason === 'NO_SKILLED_STAFF'
+            ? '该门店暂无会做此项目的员工，建议更换项目或门店。'
+            : reason === 'NO_SCHEDULE'
+              ? suggestionDates && suggestionDates.length > 0
+                ? `该日期尚未排班，最近有排班的日期：${suggestionDates.slice(0, 5).join('、')}。`
+                : '该日期尚未排班，建议改选其他日期，或先在管理后台为员工排班。'
+              : '当天可约时段已约满，建议改选其他日期、门店或员工。',
+        },
   };
 }
 
+/** 东八区日期 + N 天（用于"最近可约日"查询窗口） */
+const dayjsAddDays = (date: string, days: number) => {
+  const d = new Date(`${date}T00:00:00+08:00`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+};
+
 export async function createAppointment(input: CreateAppointmentInput) {
-  const service = await resolveService(input);
+  // 先解析门店（支持门店名），项目解析限定在门店可做范围内
+  const { store, error: storeError } = await resolveStoreOrError(input);
+  if (storeError) return storeError;
+  const storeId = store?.id ?? input.store_id?.trim();
+  if (!storeId) {
+    return { success: false as const, error_code: 'NEEDS_MORE_INFO', message: '缺少门店：请传 store_id 或 store_name' };
+  }
+  const service = await resolveService({ ...input, store_id: storeId });
   const bookable = bookableCheck(service);
   if (!bookable.ok) {
     return { success: false, error_code: bookable.error_code, message: bookable.message };
   }
-  const store = await getStore(input.store_id);
-  const staff = await getStaff(input.staff_id);
-  if (!service || !store || !staff) throw new Error('Service/store/staff not found');
+  if (!service) {
+    return { success: false, error_code: 'NOT_FOUND', message: 'service not found（可按 service_id 或 service_name 查询）' };
+  }
+  if (!store) {
+    return { success: false, error_code: 'STORE_NOT_FOUND', message: '门店不存在或已停用' };
+  }
+  // 员工解析：优先 staff_id，其次在门店内按 staff_name 解析（用户说"让李美容师服务"）
+  let staff = input.staff_id?.trim() ? await getStaff(input.staff_id.trim()) : undefined;
+  if (!staff && input.staff_name?.trim()) {
+    const storeStaff = await listStaff(store.id, undefined, input.staff_name.trim(), true, 100);
+    const matched = storeStaff.find((item) => item.name === input.staff_name?.trim())
+      ?? storeStaff.find((item) => item.name.includes(input.staff_name!.trim()));
+    staff = matched ? await getStaff(matched.id) : undefined;
+  }
+  if (!staff) return { success: false, error_code: 'NOT_FOUND', message: '员工不存在或已停用（可按 staff_id 或 staff_name 指定）' };
+  if (staff.store_id !== store.id) {
+    return { success: false, error_code: 'STORE_MISMATCH', message: `员工「${staff.name}」不属于门店「${store.name}」` };
+  }
   const scopeError = await checkServiceInStoreScope(store, service);
   if (scopeError) return scopeError;
 
@@ -186,20 +289,57 @@ export async function createAppointment(input: CreateAppointmentInput) {
     return { success: false, error_code: 'POLICY_DENIED', message: '该员工不支持此项目' };
   }
 
-  const startAt = normalizeTimestamp(input.start_at);
+  const startAt = normalizeTimestamp(input.start_at ?? '');
   const endAt = addMinutes(startAt, service.duration_minutes);
+  // 全链路最后一环：预约必须完整落在该员工一个 available 排班窗口内（用户问"某时间有没有空"的落库保证）
+  const withinSchedule = await isWithinAvailableSchedule(staff.id, startAt, endAt);
+  if (!withinSchedule) {
+    return { success: false, error_code: 'OUTSIDE_SCHEDULE', message: `该时间不在员工「${staff.name}」的排班范围内，请先 query_slots 查可约时段` };
+  }
   const customerId = resolveCustomerId(input);
+  // 顾客来自 manage_customer_session(action=identify) 会话绑定时，从顾客档案补齐姓名/手机号，预约单不再落"到店客户"+空号
+  let finalCustomerName = input.customer_name?.trim();
+  let finalCustomerPhone = input.customer_phone?.trim();
+  if (customerId?.startsWith('cust_')) {
+    const profile = await pool.query(
+      'SELECT display_name, phone_masked FROM customer_profiles WHERE customer_id = $1 LIMIT 1',
+      [customerId],
+    );
+    if (profile.rows[0]) {
+      finalCustomerName = finalCustomerName || (profile.rows[0] as { display_name: string | null }).display_name || undefined;
+      finalCustomerPhone = finalCustomerPhone || (profile.rows[0] as { phone_masked: string | null }).phone_masked || undefined;
+    }
+  }
   // 数字人链路：idempotency_key 缺省时由"客户+项目+员工+时间"确定性生成，
   // 同一客户对同一时段重复确认只会创建一条，天然幂等。
   const idempotencyKey = normalizeIdempotencyKey(
-    input.idempotency_key?.trim() ?? `create:${customerId ?? 'anon'}:${service.id}:${input.staff_id}:${startAt}`,
+    input.idempotency_key?.trim() ?? `create:${customerId ?? 'anon'}:${service.id}:${staff.id}:${startAt}`,
   );
 
-  const existing = await pool.query('SELECT * FROM appointments WHERE idempotency_key = $1 LIMIT 1', [idempotencyKey]);
-  if (existing.rows[0]) return { success: true, appointment: toAppointment(existing.rows[0]), deduplicated: true };
+  const existing = await pool.query(
+    `SELECT * FROM appointments
+     WHERE idempotency_key = $1
+        OR (customer_id = $2 AND service_id = $3 AND staff_id = $4 AND start_at = $5::timestamptz)
+     LIMIT 1`,
+    [idempotencyKey, customerId ?? 'anon', service.id, staff.id, startAt],
+  );
+  const existingAppointment = existing.rows[0] ? toAppointment(existing.rows[0] as Record<string, unknown>) : undefined;
+  const existingActive = existingAppointment != null && ['pending', 'confirmed', 'checked_in'].includes(existingAppointment.status);
+  // 同请求重复提交（网络重试/口误重复确认）→ 幂等返回原单；
+  // 注意：取消后重约的新单幂等键带 :rebook: 后缀，故同时按「客户+项目+员工+时段」命中活动单。
+  if (existingAppointment && existingActive) {
+    return {
+      success: true,
+      appointment: existingAppointment,
+      deduplicated: true,
+      spoken: { time: formatBeijing(existingAppointment.start_at), booking_code: existingAppointment.appointment_code.slice(-8) },
+    };
+  }
+  // 取消/完成/爽约后同一时段重新预约 → 旧单已终结，换新幂等键（DB 唯一约束）正常建新单
+  const effectiveIdempotencyKey = existingAppointment ? `${idempotencyKey}:rebook:${Date.now()}` : idempotencyKey;
 
   const appointmentCode = makeAppointmentCode();
-  const finalCustomerId = customerId ?? `cust_${hashIdempotencyKey(`${input.customer_phone ?? 'anon'}:${input.customer_name ?? 'guest'}`).slice(0, 12)}`;
+  const finalCustomerId = customerId ?? `cust_${hashIdempotencyKey(`${finalCustomerPhone ?? 'anon'}:${finalCustomerName ?? 'guest'}`).slice(0, 12)}`;
 
   const client = await pool.connect();
   try {
@@ -210,7 +350,7 @@ export async function createAppointment(input: CreateAppointmentInput) {
         store_id, staff_id, service_id, start_at, end_at, status, idempotency_key, note
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,$9::timestamptz,$10,$11,$12)
       RETURNING *`,
-      [appointmentCode, finalCustomerId, input.customer_name ?? '到店客户', input.customer_phone ?? '', store.id, staff.id, service.id, startAt, endAt, 'confirmed', idempotencyKey, input.note ?? null],
+      [appointmentCode, finalCustomerId, finalCustomerName ?? '到店客户', finalCustomerPhone ?? '', store.id, staff.id, service.id, startAt, endAt, 'confirmed', effectiveIdempotencyKey, input.note ?? null],
     );
     const appointment = toAppointment(inserted.rows[0] as Record<string, unknown>);
     await writeAudit({
@@ -222,7 +362,15 @@ export async function createAppointment(input: CreateAppointmentInput) {
       after_data: appointment as unknown as Record<string, unknown>,
     }, client);
     await client.query('COMMIT');
-    return { success: true, appointment };
+    return {
+      success: true,
+      appointment,
+      /** 口播专用：数字人向用户播报时使用，严禁朗读 appointment_code 全文或内部 id */
+      spoken: {
+        time: formatBeijing(startAt),
+        booking_code: appointment.appointment_code.slice(-8),
+      },
+    };
   } catch (error: any) {
     await client.query('ROLLBACK');
     if (String(error?.constraint ?? '') === 'no_staff_booking_overlap') {
@@ -308,6 +456,34 @@ export async function listStaffAvailability(input: { staff_id: string; date_from
   return listStaffSchedules(input.staff_id, input.date_from, input.date_to);
 }
 
+/** 管理后台：门店某段时间内的员工排班（带员工名） */
+export async function listStoreScheduleGrid(input: { store_id: string; date_from: string; date_to: string; staff_id?: string }) {
+  assertNonEmpty(input.store_id, 'store_id');
+  assertNonEmpty(input.date_from, 'date_from');
+  assertNonEmpty(input.date_to, 'date_to');
+  return listStoreSchedules({ store_id: input.store_id, date_from: input.date_from, date_to: input.date_to, staff_id: input.staff_id });
+}
+
+export async function upsertDayStaffSchedules(input: { store_id: string; staff_id: string; date: string; shifts: Array<{ start: string; end: string; status?: string }>; operator?: string }) {
+  return upsertDaySchedules(input);
+}
+
+export async function deleteDayStaffSchedules(input: { store_id: string; staff_id: string; date: string; start?: string; operator?: string }) {
+  return deleteDaySchedules(input);
+}
+
+export async function applyStaffWeeklySchedule(input: {
+  store_id: string;
+  staff_id: string;
+  date_from: string;
+  date_to: string;
+  weekdays: number[];
+  shifts: Array<{ start: string; end: string; status?: string }>;
+  operator?: string;
+}) {
+  return applyWeeklyScheduleTemplate(input);
+}
+
 export async function getAppointmentTimeline(input: { customer_id: string; appointment_id?: string; appointment_code?: string }) {
   const detail = await getAppointmentByCustomer(input);
   return detail;
@@ -370,6 +546,40 @@ export async function cancelAppointment(input: CancelAppointmentInput) {
   });
 }
 
+/** 管理端取消（管理后台/店长）：按 appointment_id 直达，不校验顾客归属。
+ *  与顾客取消的区别：操作人记为 staff/operator，且允许取消 checked_in 之外的任意状态。 */
+export async function adminCancelAppointment(input: { appointment_id: string; operator?: string; reason?: string }) {
+  assertNonEmpty(input.appointment_id, 'appointment_id');
+  const appointment = await getAppointment(input.appointment_id);
+  if (!appointment) return { success: false as const, error_code: 'NOT_FOUND', message: '预约不存在' };
+  if (appointment.status === 'cancelled') return { success: false as const, error_code: 'INVALID_STATE', message: '该预约已是取消状态' };
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `UPDATE appointments SET status='cancelled', updated_at=now() WHERE id=$1 RETURNING *`,
+      [appointment.id],
+    );
+    const next = toAppointment(updated.rows[0] as Record<string, unknown>);
+    await writeAudit({
+      appointment_id: next.id,
+      operator_type: 'staff',
+      operator_id: input.operator ?? 'admin',
+      action: 'cancel',
+      before_data: appointment as unknown as Record<string, unknown>,
+      after_data: next as unknown as Record<string, unknown>,
+    }, client);
+    await client.query('COMMIT');
+    return { success: true as const, appointment: next };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export async function rescheduleAppointment(input: RescheduleAppointmentInput) {
   const customerId = resolveCustomerId(input);
   assertCustomerIdentity(customerId);
@@ -400,6 +610,13 @@ export async function rescheduleAppointment(input: RescheduleAppointmentInput) {
       const service = await getService(appointment.service_id);
       if (!service) throw new Error('Service not found');
       const newEndAt = addMinutes(newStartAt, service.duration_minutes);
+
+      // 与 create 同一约束：新时段必须完整落在该员工一个 available 排班窗口内，
+      // 否则改期会把预约挪到排班外（员工实际不上班的时间）。
+      const withinSchedule = await isWithinAvailableSchedule(appointment.staff_id, newStartAt, newEndAt);
+      if (!withinSchedule) {
+        return { success: false, error_code: 'OUTSIDE_SCHEDULE', message: '新时段不在员工排班范围内，请先 query_slots 查可约时段' };
+      }
 
       const client = await pool.connect();
       try {

@@ -42,6 +42,27 @@ export function normalizeDate(value: string): string {
 
 export const makeAppointmentCode = () => `apt_${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}_${crypto.randomBytes(3).toString('hex')}`;
 
+/**
+ * 东八区本地时间字符串（YYYY-MM-DD HH:mm）。
+ * MCP 工具面向 LLM 的时间一律用本地时区：裸 UTC ISO（如 2026-09-08T01:00:00Z）
+ * 会被 LLM 误读成"凌晨1点"（实际是北京时间 09:00），导致预约时间张冠李戴。
+ */
+export function formatBeijing(value: string | Date): string {
+  const date = typeof value === 'string' ? new Date(value) : value;
+  if (Number.isNaN(date.getTime())) return String(value);
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
+  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
+}
+
 export const hashIdempotencyKey = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
 
 export const addMinutes = (start: string | Date, minutes: number) => new Date(new Date(start).getTime() + minutes * 60_000).toISOString();

@@ -158,10 +158,45 @@ export async function queryMcpCallLogs(input: McpCallLogQuery = {}): Promise<Mcp
   }
 }
 
-/** 调用日志的最新一条（兜底给 && overview 快速展示，DB 异常时返回内存数据）。 */
+/** 调用日志的最新一条（兜底给 overview 快速展示，DB 异常时返回内存数据）。 */
 export async function listRecentMcpCalls(limit = 20): Promise<McpCallLog[]> {
   const page = await queryMcpCallLogs({ limit });
   return page.items;
+}
+
+const removeFromBuffer = (ids: Set<string>) => {
+  for (let index = recentBuffer.length - 1; index >= 0; index -= 1) {
+    if (ids.has(recentBuffer[index].id)) recentBuffer.splice(index, 1);
+  }
+};
+
+/** 删除单条调用日志（内存缓冲同步移除；DB 异常时视为已删除）。 */
+export async function deleteMcpCallLog(id: string): Promise<boolean> {
+  if (!id?.trim()) return false;
+  const trimmed = id.trim();
+  removeFromBuffer(new Set([trimmed]));
+  try {
+    const result = await pool.query('DELETE FROM mcp_call_logs WHERE id = $1', [trimmed]);
+    return (result.rowCount ?? 0) > 0;
+  } catch (error) {
+    console.error('[mcp-call-log] delete failed', error);
+    return false;
+  }
+}
+
+/** 批量删除调用日志，返回实际删除条数。空数组返回 0。 */
+export async function deleteMcpCallLogs(ids: string[]): Promise<number> {
+  const uniqueIds = Array.from(new Set((ids ?? []).map((id) => id?.trim()).filter(Boolean)));
+  if (uniqueIds.length === 0) return 0;
+  removeFromBuffer(new Set(uniqueIds));
+  try {
+    // id 列为 UUID：与 text[] 参数比较需先转文本（否则 uuid=text 无操作符报错）
+    const result = await pool.query('DELETE FROM mcp_call_logs WHERE id::text = ANY($1::text[])', [uniqueIds]);
+    return result.rowCount ?? 0;
+  } catch (error) {
+    console.error('[mcp-call-log] batch delete failed', error);
+    return 0;
+  }
 }
 
 /** 调用日志统计分析（给日志中心图表用）。 */

@@ -104,6 +104,10 @@ export interface Appointment {
   note?: string;
   created_at: string;
   updated_at: string;
+  /** query_bookings(scope=my) 等顾客查询附带联表名称（数字人对话需要直接看到项目名） */
+  service_name?: string | null;
+  staff_name?: string | null;
+  store_name?: string | null;
 }
 
 export interface AppointmentListItem {
@@ -217,6 +221,35 @@ export const api = {
     const qs = new URLSearchParams({ from, to });
     return request<{ success: true; schedules: StaffSchedule[] }>(`/api/staff/${staffId}/schedules?${qs}`);
   },
+  async storeSchedules(params: { store_id: string; date_from: string; date_to: string; staff_id?: string }) {
+    const qs = new URLSearchParams({ store_id: params.store_id, date_from: params.date_from, date_to: params.date_to });
+    if (params.staff_id) qs.set('staff_id', params.staff_id);
+    return request<{ success: true; staff: StaffWithSkills[]; schedules: (StaffSchedule & { staff_name: string })[] }>(`/api/store-schedules?${qs}`);
+  },
+  async upsertDaySchedule(body: { store_id: string; staff_id: string; date: string; shifts: Array<{ start: string; end: string; status?: ScheduleStatus }>; operator?: string }) {
+    return request<{ success: boolean; created: number; schedules: StaffSchedule[]; affected_appointments?: Array<{ id: string; appointment_code: string; customer_name: string; start_at: string; end_at: string }>; error?: string }>('/api/store-schedules/day', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+  async deleteDaySchedule(body: { store_id: string; staff_id: string; date: string; start?: string; operator?: string }) {
+    return request<{ success: boolean; deleted: number; affected_appointments?: Array<{ id: string; appointment_code: string; customer_name: string; start_at: string; end_at: string }>; error?: string }>('/api/store-schedules/day', {
+      method: 'DELETE',
+      body: JSON.stringify(body),
+    });
+  },
+  async applyWeeklySchedule(body: { store_id: string; staff_id: string; date_from: string; date_to: string; weekdays: number[]; shifts: Array<{ start: string; end: string; status?: ScheduleStatus }>; operator?: string }) {
+    return request<{ success: boolean; applied: Array<{ date: string; shifts: number }>; skipped: string[]; error?: string }>('/api/store-schedules/weekly', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+  async createSchedules(staffId: string, schedules: Array<{ start_at: string; end_at: string; status?: ScheduleStatus }>, operator?: string) {
+    return request<{ success: boolean; created: number; schedules: StaffSchedule[]; error?: string }>(`/api/staff/${staffId}/schedules`, {
+      method: 'POST',
+      body: JSON.stringify({ schedules, operator }),
+    });
+  },
   async appointments(params: {
     store_id?: string;
     staff_id?: string;
@@ -292,6 +325,17 @@ export const api = {
   },
   async mcpCallLogStats() {
     return request<{ success: true; stats: McpCallLogStats }>('/api/logs/mcp-calls/stats');
+  },
+  async deleteMcpCallLog(id: string) {
+    return request<{ success: boolean; deleted: boolean }>(`/api/logs/mcp-calls/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+  },
+  async deleteMcpCallLogs(ids: string[]) {
+    return request<{ success: boolean; deleted: number }>('/api/logs/mcp-calls/delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    });
   },
   async appointmentByCode(code: string) {
     if (!code) return null;

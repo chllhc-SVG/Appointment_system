@@ -34,6 +34,9 @@ services:
       MCP_HTTP_PORT: 4020
       TZ: Asia/Shanghai
       MCP_MODE: http
+      # 顾客身份模型：personal=数字人账号即顾客；shared=共享终端需 identify_customer 识别顾客
+      IDENTITY_MODE: ${IDENTITY_MODE:-shared}
+      CUSTOMER_SESSION_TTL_MS: ${CUSTOMER_SESSION_TTL_MS:-1800000}
       # ADMIN_TOKEN: replace-me
       # 知识库项目管理同步源（GET /api/kb/projects，Bearer 鉴权）
       KNOWLEDGE_BASE_URL: ${KNOWLEDGE_BASE_URL:-http://host.docker.internal:3001}
@@ -51,7 +54,7 @@ services:
       mcp.healthPath: "/healthz"
       mcp.transport: "streamable_http"
       mcp.url: "http://appointment-service:4020/mcp"
-      mcp.include_tools: "search_available_slots,create_appointment,get_my_appointments,get_appointment_detail,cancel_appointment,reschedule_appointment,list_booking_reference_data,list_store_services,list_store_staff,list_staff_availability,list_appointments,get_appointment_overview,list_appointment_audits,confirm_appointment,check_in_appointment,complete_appointment,mark_no_show_appointment"
+      mcp.include_tools: "list_booking_reference,list_store_services,list_store_staff,list_staff_availability,manage_staff_schedules,query_slots,query_bookings,manage_booking,manage_customer_session"
 
   web:
     build:

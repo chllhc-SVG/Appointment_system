@@ -1,4 +1,5 @@
 import { pool } from './db/pool.js';
+import { formatBeijing } from './utils.js';
 import type {
   Appointment,
   AppointmentAudit,
@@ -119,7 +120,7 @@ export async function getService(id: string) {
  *  传入 storeId 时限定该店可做范围（store_services，旧数据无勾选时回退"店内在职员工可做项目"），
  *  避免数字人约到该店未开通的项目。 */
 export async function findServiceByName(name: string, storeId?: string) {
-  const params: unknown[] = [name.trim()];
+  const params: unknown[] = [];
   const conditions: string[] = [`s.is_active = true`];
   if (storeId?.trim()) {
     params.push(storeId.trim());
@@ -217,25 +218,40 @@ export async function listAppointmentsByCustomer(
   serviceName?: string,
   keyword?: string,
 ) {
-  const conditions: string[] = ['customer_id = $1'];
+  const conditions: string[] = ['a.customer_id = $1'];
   const params: unknown[] = [customerId];
-  if (fromDate) { params.push(fromDate); conditions.push(`start_at >= $${params.length}`); }
-  if (toDate) { params.push(toDate); conditions.push(`start_at <= $${params.length}`); }
-  if (status) { params.push(status); conditions.push(`status = $${params.length}`); }
+  if (fromDate) { params.push(fromDate); conditions.push(`a.start_at >= $${params.length}`); }
+  if (toDate) { params.push(toDate); conditions.push(`a.start_at <= $${params.length}`); }
+  if (status) { params.push(status); conditions.push(`a.status = $${params.length}`); }
   if (serviceName?.trim()) {
     params.push(`%${serviceName.trim()}%`);
-    conditions.push(`EXISTS (SELECT 1 FROM services sv WHERE sv.id = appointments.service_id AND sv.name ILIKE $${params.length})`);
+    conditions.push(`EXISTS (SELECT 1 FROM services sv WHERE sv.id = a.service_id AND sv.name ILIKE $${params.length})`);
   }
   if (keyword?.trim()) {
     params.push(`%${keyword.trim()}%`);
     conditions.push(`(
-      appointment_code ILIKE $${params.length}
-      OR EXISTS (SELECT 1 FROM services sv2 WHERE sv2.id = appointments.service_id AND sv2.name ILIKE $${params.length})
-      OR EXISTS (SELECT 1 FROM staff sf WHERE sf.id = appointments.staff_id AND sf.name ILIKE $${params.length})
+      a.appointment_code ILIKE $${params.length}
+      OR EXISTS (SELECT 1 FROM services sv2 WHERE sv2.id = a.service_id AND sv2.name ILIKE $${params.length})
+      OR EXISTS (SELECT 1 FROM staff sf WHERE sf.id = a.staff_id AND sf.name ILIKE $${params.length})
     )`);
   }
-  const { rows } = await pool.query(`SELECT * FROM appointments WHERE ${conditions.join(' AND ')} ORDER BY start_at DESC`, params);
-  return rows.map(mapAppointment);
+  // 关联服务/员工/门店：数字人对话与日志中心能直接展示项目名、员工名、门店名，而不是只有 id
+  const { rows } = await pool.query(
+    `SELECT a.*, sv.name AS service_name, st.name AS staff_name, st2.name AS store_name
+     FROM appointments a
+     LEFT JOIN services sv ON sv.id = a.service_id
+     LEFT JOIN staff st ON st.id = a.staff_id
+     LEFT JOIN stores st2 ON st2.id = a.store_id
+     WHERE ${conditions.join(' AND ')}
+     ORDER BY a.start_at DESC`,
+    params,
+  );
+  return rows.map((row) => ({
+    ...mapAppointment(row),
+    service_name: (row.service_name as string) ?? null,
+    staff_name: (row.staff_name as string) ?? null,
+    store_name: (row.store_name as string) ?? null,
+  }));
 }
 
 export async function listAppointmentsByFilters(input: {
@@ -282,6 +298,23 @@ export async function listAppointmentsByFilters(input: {
   }));
 }
 
+/** 按名称模糊匹配门店（数字人用户直接说"上海徐汇门店"即可解析），多命中取第一个 */
+export async function findStoreByName(name: string) {
+  const { rows } = await pool.query(
+    `SELECT
+       st.*,
+       COALESCE(array_agg(ss.service_id) FILTER (WHERE ss.service_id IS NOT NULL), '{}') AS service_ids
+     FROM stores st
+     LEFT JOIN store_services ss ON ss.store_id = st.id
+     WHERE st.is_active = true AND st.name ILIKE $1
+     GROUP BY st.id
+     ORDER BY st.name ASC
+     LIMIT 1`,
+    [`%${name.trim()}%`],
+  );
+  return rows[0] ? mapStore(rows[0]) : undefined;
+}
+
 export async function listStaffSchedules(staffId: string, dateFrom: string, dateTo: string) {
   const { rows } = await pool.query(
     `SELECT *
@@ -293,6 +326,119 @@ export async function listStaffSchedules(staffId: string, dateFrom: string, date
     [staffId, dateFrom, dateTo],
   );
   return rows.map(mapSchedule);
+}
+
+/** 批量查询多名员工的排班（一次查询替代 N+1），附员工名供日历/诊断直接展示 */
+export async function listStaffSchedulesBulk(staffIds: string[], dateFrom: string, dateTo: string): Promise<(StaffSchedule & { staff_name: string })[]> {
+  if (staffIds.length === 0) return [];
+  const { rows } = await pool.query(
+    `SELECT sch.*, st.name AS staff_name
+     FROM staff_schedules sch
+     JOIN staff st ON st.id = sch.staff_id
+     WHERE sch.staff_id = ANY($1)
+       AND sch.start_at < $3
+       AND sch.end_at > $2
+     ORDER BY sch.start_at ASC`,
+    [staffIds, dateFrom, dateTo],
+  );
+  return rows.map((row) => ({ ...mapSchedule(row), staff_name: row.staff_name as string }));
+}
+
+/** 批量查询多名员工在时间窗内的占用预约（一次查询替代 N+1） */
+export async function listBusyAppointmentsBulk(staffIds: string[], startAt: string, endAt: string) {
+  if (staffIds.length === 0) return [];
+  const { rows } = await pool.query(
+    `SELECT * FROM appointments
+     WHERE staff_id = ANY($1)
+       AND status IN ('pending', 'confirmed', 'checked_in')
+       AND tstzrange(start_at, end_at, '[)') && tstzrange($2::timestamptz, $3::timestamptz, '[)')
+     ORDER BY start_at ASC`,
+    [staffIds, startAt, endAt],
+  );
+  return rows.map(mapAppointment);
+}
+
+/**
+ * 统一的可约时段计算：员工排班 ∩（排除已占预约）。
+ * 排班步长 = max(项目时长, 30min)，与预约重叠即排除该起点。
+ */
+export async function computeAvailableSlots(service: Service, staffList: Staff[], date: string): Promise<TimeSlot[]> {
+  if (staffList.length === 0) return [];
+  const dateStart = new Date(`${date}T00:00:00+08:00`).toISOString();
+  const dateEnd = new Date(`${date}T23:59:59+08:00`).toISOString();
+  const staffIds = staffList.map((staff) => staff.id);
+  const [schedules, busy] = await Promise.all([
+    listStaffSchedulesBulk(staffIds, dateStart, dateEnd),
+    listBusyAppointmentsBulk(staffIds, dateStart, dateEnd),
+  ]);
+  const busyByStaff = new Map<string, Appointment[]>();
+  for (const appointment of busy) {
+    const list = busyByStaff.get(appointment.staff_id) ?? [];
+    list.push(appointment);
+    busyByStaff.set(appointment.staff_id, list);
+  }
+  const slots: TimeSlot[] = [];
+  const stepMs = Math.max(service.duration_minutes, 30) * 60_000;
+  const durationMs = service.duration_minutes * 60_000;
+  for (const staff of staffList) {
+    const busyForStaff = busyByStaff.get(staff.id) ?? [];
+    for (const schedule of schedules.filter((item) => item.staff_id === staff.id)) {
+      if (schedule.status !== 'available') continue;
+      const cursor = new Date(schedule.start_at).getTime();
+      const end = new Date(schedule.end_at).getTime();
+      for (let current = cursor; current + durationMs <= end; current += stepMs) {
+        const startAt = new Date(current).toISOString();
+        const slotEnd = new Date(current + durationMs).toISOString();
+        const overlaps = busyForStaff.some((appointment) =>
+          new Date(appointment.start_at).getTime() < new Date(slotEnd).getTime() &&
+          new Date(appointment.end_at).getTime() > new Date(startAt).getTime(),
+        );
+        if (!overlaps) {
+          slots.push({
+            staff_id: staff.id,
+            staff_name: staff.name,
+            start_at: startAt,
+            end_at: slotEnd,
+            start_local: formatBeijing(startAt),
+            end_local: formatBeijing(slotEnd),
+          });
+        }
+      }
+    }
+  }
+  return slots;
+}
+
+/** 校验预约时段是否完整落在该员工一个 available 排班窗口内（"在相应的时间段有时间"的落库保证） */
+export async function isWithinAvailableSchedule(staffId: string, startAt: string, endAt: string) {
+  const { rowCount } = await pool.query(
+    `SELECT 1 FROM staff_schedules
+     WHERE staff_id = $1
+       AND status = 'available'
+       AND start_at <= $2::timestamptz
+       AND end_at >= $3::timestamptz
+     LIMIT 1`,
+    [staffId, startAt, endAt],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/** 查询某员工在日期范围内（含边界）的可用排班日期（YYYY-MM-DD，东八区），用于"最近可约日"建议 */
+export async function listAvailableScheduleDates(staffIds: string[], dateFrom: string, dateTo: string): Promise<string[]> {
+  if (staffIds.length === 0) return [];
+  const fromIso = new Date(`${dateFrom}T00:00:00+08:00`).toISOString();
+  const toIso = new Date(`${dateTo}T23:59:59+08:00`).toISOString();
+  const { rows } = await pool.query(
+    `SELECT DISTINCT to_char(start_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD') AS day
+     FROM staff_schedules
+     WHERE staff_id = ANY($1)
+       AND status = 'available'
+       AND start_at >= $2::timestamptz
+       AND start_at < $3::timestamptz
+     ORDER BY day ASC`,
+    [staffIds, fromIso, toIso],
+  );
+  return rows.map((row) => row.day as string);
 }
 
 export async function listBusyAppointments(staffId: string, startAt: string, endAt: string) {
@@ -308,8 +454,9 @@ export async function listBusyAppointments(staffId: string, startAt: string, end
 }
 
 export async function listStaffSkillsForService(serviceId: string, storeId?: string) {
-  const params: unknown[] = [serviceId];
+  const params: unknown[] = [];
   const conditions: string[] = ['sk.service_id = $1'];
+  params.push(serviceId);
   if (storeId?.trim()) {
     params.push(storeId.trim());
     conditions.push(`s.store_id = $${params.length}`);
@@ -329,36 +476,10 @@ export async function listStaffSkillsForService(serviceId: string, storeId?: str
 export async function searchAvailableTimeSlots(serviceId: string, storeId: string | undefined, date: string, preferredStaffId?: string): Promise<TimeSlot[]> {
   const service = await getService(serviceId);
   if (!service) return [];
-
-  const dateStart = new Date(`${date}T00:00:00+08:00`).toISOString();
-  const dateEnd = new Date(`${date}T23:59:59+08:00`).toISOString();
-
-  const staffList = preferredStaffId ? [await getStaff(preferredStaffId)].filter(Boolean) as Staff[] : await listStaffSkillsForService(serviceId, storeId);
-  const slots: TimeSlot[] = [];
-
-  for (const staff of staffList) {
-    const schedules = await listStaffSchedules(staff.id, dateStart, dateEnd);
-    for (const schedule of schedules) {
-      if (schedule.status !== 'available') continue;
-      const busy = await listBusyAppointments(staff.id, schedule.start_at, schedule.end_at);
-      const cursor = new Date(schedule.start_at).getTime();
-      const end = new Date(schedule.end_at).getTime();
-      const step = Math.max(service.duration_minutes, 30) * 60_000;
-      for (let current = cursor; current + service.duration_minutes * 60_000 <= end; current += step) {
-        const startAt = new Date(current).toISOString();
-        const slotEnd = new Date(current + service.duration_minutes * 60_000).toISOString();
-        const overlaps = busy.some((appointment) =>
-          new Date(appointment.start_at).getTime() < new Date(slotEnd).getTime() &&
-          new Date(appointment.end_at).getTime() > new Date(startAt).getTime(),
-        );
-        if (!overlaps) {
-          slots.push({ staff_id: staff.id, staff_name: staff.name, start_at: startAt, end_at: slotEnd });
-        }
-      }
-    }
-  }
-
-  return slots;
+  const staffList = preferredStaffId
+    ? [await getStaff(preferredStaffId)].filter(Boolean) as Staff[]
+    : await listStaffSkillsForService(serviceId, storeId);
+  return computeAvailableSlots(service, staffList, date);
 }
 
 export async function listAuditsByAppointment(appointmentId: string) {

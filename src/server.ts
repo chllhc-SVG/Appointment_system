@@ -3,19 +3,22 @@ import type { AppointmentToolSet } from './tools/tools.js';
 import { listStaff, listServices, listStores } from './queries.js';
 import { getAppointment, getAppointmentByCode, listStaffSchedules, listAuditsByAppointment } from './queries.js';
 import { confirmAppointment, createAppointment, cancelAppointment, rescheduleAppointment, checkInAppointment, completeAppointment, markNoShowAppointment, listAppointments, getAppointmentOverview, searchAvailableSlots } from './services/appointments.js';
-import { listRecentMcpCalls, mcpCallLogStats, queryMcpCallLogs } from './services/mcp-call-log.js';
+import { deleteMcpCallLog, deleteMcpCallLogs, listRecentMcpCalls, mcpCallLogStats, queryMcpCallLogs } from './services/mcp-call-log.js';
 import {
   createService,
   createStaff,
+  createStaffSchedules,
   createStore,
   deleteService,
   deleteStaff,
   deleteStore,
   listEntityAudits,
+  listStaffSchedulesForStaff,
   updateService,
   updateStaff,
   updateStore,
 } from './services/catalog.js';
+import { applyStaffWeeklySchedule, adminCancelAppointment, deleteDayStaffSchedules, listStoreScheduleGrid, upsertDayStaffSchedules } from './services/appointments.js';
 import { listSyncRuns, syncServicesFromKnowledgeBase } from './services/kb-sync.js';
 
 const asString = (value: unknown) => (typeof value === 'string' ? value : undefined);
@@ -245,6 +248,29 @@ export function createApiServer(tools: AppointmentToolSet, adminToken?: string):
     }
   });
 
+  app.delete('/api/logs/mcp-calls/:logId', async (req, res) => {
+    try {
+      const deleted = await deleteMcpCallLog(req.params.logId);
+      res.json({ success: true, deleted });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/api/logs/mcp-calls/delete', async (req, res) => {
+    try {
+      const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((v: unknown): v is string => typeof v === 'string') : [];
+      if (ids.length === 0) {
+        res.status(400).json({ success: false, error: 'ids is required' });
+        return;
+      }
+      const deleted = await deleteMcpCallLogs(ids);
+      res.json({ success: true, deleted });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.get('/api/logs/mcp-calls/stats', async (_req, res) => {
     try {
       const stats = await mcpCallLogStats(14);
@@ -299,6 +325,161 @@ export function createApiServer(tools: AppointmentToolSet, adminToken?: string):
       res.json({ success: true, schedules });
     } catch (error) {
       res.status(500).json({ success: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/api/staff/:staffId/schedules', async (req, res) => {
+    try {
+      const body = req.body ?? {};
+      const schedules = Array.isArray(body.schedules) ? body.schedules : [];
+      if (schedules.length === 0) {
+        res.status(400).json({ success: false, error: 'schedules is required' });
+        return;
+      }
+      const created = await createStaffSchedules({
+        staff_id: req.params.staffId,
+        schedules,
+        operator: asString(body.operator),
+      });
+      res.json({ success: true, created: created.length, schedules: created });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get('/api/staff-schedules', async (req, res) => {
+    try {
+      const rows = await listStaffSchedulesForStaff(asString(req.query.staff_id));
+      res.json({ success: true, schedules: rows });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  // ===== 日历式排班（门店维度）：一次拉全店员工班次；按天建/改/删 =====
+  app.get('/api/store-schedules', async (req, res) => {
+    try {
+      const storeId = asString(req.query.store_id);
+      const from = asString(req.query.date_from) ?? asString(req.query.from) ?? '';
+      const to = asString(req.query.date_to) ?? asString(req.query.to) ?? '';
+      if (!storeId || !from || !to) {
+        res.status(400).json({ success: false, error: 'store_id, date_from, date_to are required' });
+        return;
+      }
+      const grid = await listStoreScheduleGrid({ store_id: storeId, date_from: from, date_to: to, staff_id: asString(req.query.staff_id) });
+      res.json({ success: true, ...grid });
+    } catch (error) {
+      res.status(400).json({ success: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.put('/api/store-schedules/day', async (req, res) => {
+    try {
+      const body = req.body ?? {};
+      const storeId = asString(body.store_id);
+      const staffId = asString(body.staff_id);
+      const date = asString(body.date);
+      const shifts = Array.isArray(body.shifts) ? body.shifts : [];
+      if (!storeId || !staffId || !date) {
+        res.status(400).json({ success: false, error: 'store_id, staff_id, date are required' });
+        return;
+      }
+      // shifts 为空数组 = 清空该员工该天全部班次（UI "清空后保存" 语义），等价于按天删除
+      if (shifts.length === 0) {
+        const result = await deleteDayStaffSchedules({
+          store_id: storeId,
+          staff_id: staffId,
+          date,
+          operator: asString(body.operator),
+        });
+        res.json({
+          success: true,
+          created: 0,
+          deleted: Array.isArray(result.deleted) ? result.deleted.length : 0,
+          affected_appointments: result.affected_appointments,
+          schedules: [],
+        });
+        return;
+      }
+      const result = await upsertDayStaffSchedules({
+        store_id: storeId,
+        staff_id: staffId,
+        date,
+        shifts: shifts.map((item: { start?: unknown; end?: unknown; status?: unknown }) => ({
+          start: asString(item.start) ?? '',
+          end: asString(item.end) ?? '',
+          status: asString(item.status),
+        })),
+        operator: asString(body.operator),
+      });
+      res.json({ success: true, created: result.schedules.length, schedules: result.schedules, affected_appointments: result.affected_appointments });
+    } catch (error) {
+      res.status(400).json({ success: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.delete('/api/store-schedules/day', async (req, res) => {
+    try {
+      const body = req.body ?? {};
+      const storeId = asString(body.store_id);
+      const staffId = asString(body.staff_id);
+      const date = asString(body.date);
+      if (!storeId || !staffId || !date) {
+        res.status(400).json({ success: false, error: 'store_id, staff_id, date are required' });
+        return;
+      }
+      const result = await deleteDayStaffSchedules({
+        store_id: storeId,
+        staff_id: staffId,
+        date,
+        start: asString(body.start),
+        operator: asString(body.operator),
+      });
+      res.json({
+        success: true,
+        deleted: Array.isArray(result.deleted) ? result.deleted.length : 0,
+        affected_appointments: result.affected_appointments,
+        schedules: Array.isArray(result.deleted) ? result.deleted : [],
+      });
+    } catch (error) {
+      res.status(400).json({ success: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  // 周模板排班：把每周固定班批量铺到日期范围（只填空白天，不覆盖已有排班）
+  app.post('/api/store-schedules/weekly', async (req, res) => {
+    try {
+      const body = req.body ?? {};
+      const storeId = asString(body.store_id);
+      const staffId = asString(body.staff_id);
+      const dateFrom = asString(body.date_from);
+      const dateTo = asString(body.date_to);
+      const weekdays = Array.isArray(body.weekdays) ? body.weekdays.map(Number).filter(Number.isInteger) : [];
+      const shifts = Array.isArray(body.shifts) ? body.shifts : [];
+      if (!storeId || !staffId || !dateFrom || !dateTo) {
+        res.status(400).json({ success: false, error: 'store_id, staff_id, date_from, date_to are required' });
+        return;
+      }
+      if (weekdays.length === 0) {
+        res.status(400).json({ success: false, error: 'weekdays is required（1=周一 ... 7=周日）' });
+        return;
+      }
+      const result = await applyStaffWeeklySchedule({
+        store_id: storeId,
+        staff_id: staffId,
+        date_from: dateFrom,
+        date_to: dateTo,
+        weekdays,
+        shifts: shifts.map((item: { start?: unknown; end?: unknown; status?: unknown }) => ({
+          start: asString(item.start) ?? '',
+          end: asString(item.end) ?? '',
+          status: asString(item.status),
+        })),
+        operator: asString(body.operator),
+      });
+      res.json({ success: true, ...result });
+    } catch (error) {
+      res.status(400).json({ success: false, error: error instanceof Error ? error.message : String(error) });
     }
   });
 
@@ -392,6 +573,16 @@ export function createApiServer(tools: AppointmentToolSet, adminToken?: string):
 
   app.post('/api/appointments/:appointmentId/cancel', async (req, res) => {
     try {
+      // 管理端取消（带 operator 或 customer_id 缺省时）：按 id 直达，不校验顾客归属
+      if (asString(req.body?.operator) || !asString(req.body?.customer_id)) {
+        const result = await adminCancelAppointment({
+          appointment_id: req.params.appointmentId,
+          operator: asString(req.body?.operator),
+          reason: asString(req.body?.reason),
+        });
+        res.json(result);
+        return;
+      }
       const result = await cancelAppointment({ appointment_id: req.params.appointmentId, customer_id: asString(req.body?.customer_id) ?? '', reason: asString(req.body?.reason), idempotency_key: asString(req.body?.idempotency_key) ?? req.params.appointmentId });
       res.json(result);
     } catch (error) {

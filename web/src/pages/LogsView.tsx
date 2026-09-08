@@ -4,6 +4,7 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   DatabaseOutlined,
+  DeleteOutlined,
   FireOutlined,
   ReloadOutlined,
   RobotOutlined,
@@ -17,6 +18,7 @@ import {
   Col,
   Drawer,
   Input,
+  Modal,
   Progress,
   Row,
   Select,
@@ -34,23 +36,14 @@ import { api, type McpCallLog, type McpCallLogStats } from '../api/client';
 const { Title, Paragraph, Text } = Typography;
 
 const TOOL_LABELS: Record<string, string> = {
-  search_available_slots: '查询可用时段',
-  create_appointment: '创建预约',
-  get_my_appointments: '我的预约',
-  get_appointment_detail: '预约详情',
-  cancel_appointment: '取消预约',
-  reschedule_appointment: '改期预约',
-  list_booking_reference_data: '门店/项目/员工',
+  list_booking_reference: '门店列表',
   list_store_services: '门店项目',
   list_store_staff: '门店员工',
   list_staff_availability: '员工排班',
-  list_appointments: '预约列表',
-  get_appointment_overview: '预约概览',
-  list_appointment_audits: '预约轨迹',
-  confirm_appointment: '确认预约',
-  check_in_appointment: '到店签到',
-  complete_appointment: '完成预约',
-  mark_no_show_appointment: '标记爽约',
+  query_slots: '查询可用时段',
+  query_bookings: '查询预约',
+  manage_booking: '预约动作',
+  manage_customer_session: '顾客会话',
 };
 
 const transportColors: Record<string, string> = {
@@ -185,6 +178,7 @@ export function LogsView() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [selected, setSelected] = useState<McpCallLog | null>(null);
+  const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
   const [version, setVersion] = useState(0);
 
   const load = useCallback(async () => {
@@ -215,7 +209,57 @@ export function LogsView() {
   }, [load]);
 
   const refresh = () => {
+    setSelectedKeys([]);
     setVersion((v) => v + 1);
+  };
+
+  const deleteOne = (record: McpCallLog) => {
+    Modal.confirm({
+      title: '删除该条调用日志？',
+      icon: <WarningOutlined style={{ color: '#ff4d4f' }} />,
+      content: `${dayjs(record.created_at).format('YYYY-MM-DD HH:mm:ss')} · ${record.tool_name}（${record.request_id}）`,
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          const result = await api.deleteMcpCallLog(record.id);
+          if (!result.deleted) message.info('日志不存在或已被删除');
+          else message.success('已删除');
+          setSelectedKeys((keys) => keys.filter((key) => key !== record.id));
+          setVersion((v) => v + 1);
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : '删除失败');
+        }
+      },
+    });
+  };
+
+  const batchDelete = () => {
+    const ids = selectedKeys.map(String);
+    if (ids.length === 0) return;
+    Modal.confirm({
+      title: `删除选中的 ${ids.length} 条调用日志？`,
+      icon: <WarningOutlined style={{ color: '#ff4d4f' }} />,
+      content: '删除后不可恢复。',
+      okText: `批量删除（${ids.length}）`,
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          const result = await api.deleteMcpCallLogs(ids);
+          message.success(`已删除 ${result.deleted} 条`);
+          setSelectedKeys([]);
+          setVersion((v) => v + 1);
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : '批量删除失败');
+        }
+      },
+    });
+  };
+
+  const selectAllPage = () => {
+    setSelectedKeys(logs.map((log) => log.id));
   };
 
   const successCount = logs.filter((log) => log.success).length;
@@ -373,12 +417,27 @@ export function LogsView() {
           <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
         </Space>
 
+        {selectedKeys.length > 0 && (
+          <Space style={{ marginBottom: 12 }}>
+            <Text type="secondary">已选 {selectedKeys.length} 条</Text>
+            <Button size="small" onClick={selectAllPage}>全选本页</Button>
+            <Button size="small" onClick={() => setSelectedKeys([])}>取消选择</Button>
+            <Button size="small" danger icon={<DeleteOutlined />} onClick={batchDelete}>
+              批量删除
+            </Button>
+          </Space>
+        )}
+
         <Table<McpCallLog>
           rowKey="id"
           dataSource={logs}
           loading={loading}
           size="middle"
-          scroll={{ x: 1080 }}
+          scroll={{ x: 1180 }}
+          rowSelection={{
+            selectedRowKeys: selectedKeys,
+            onChange: (keys) => setSelectedKeys(keys),
+          }}
           pagination={{
             current: page,
             pageSize,
@@ -453,9 +512,22 @@ export function LogsView() {
             {
               title: '操作',
               key: 'action',
-              width: 90,
+              width: 160,
               fixed: 'right',
-              render: (_, record) => <Button size="small" onClick={() => setSelected(record)}>详情</Button>,
+              render: (_, record) => (
+                <Space size={4}>
+                  <Button size="small" type="link" onClick={() => setSelected(record)}>详情</Button>
+                  <Button
+                    size="small"
+                    type="link"
+                    danger
+                    icon={<DeleteOutlined />}
+                    onClick={() => deleteOne(record)}
+                  >
+                    删除
+                  </Button>
+                </Space>
+              ),
             },
           ]}
         />
@@ -466,6 +538,22 @@ export function LogsView() {
         width={640}
         open={selected !== null}
         onClose={() => setSelected(null)}
+        extra={
+          selected ? (
+            <Button
+              size="small"
+              danger
+              icon={<DeleteOutlined />}
+              onClick={() => {
+                const record = selected;
+                setSelected(null);
+                deleteOne(record);
+              }}
+            >
+              删除该条
+            </Button>
+          ) : null
+        }
       >
         {selected && (
           <Space direction="vertical" style={{ width: '100%' }} size={16}>
