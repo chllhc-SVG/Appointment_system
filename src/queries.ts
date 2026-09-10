@@ -280,13 +280,16 @@ export async function listAppointmentsByFilters(input: {
   const offset = Math.max(0, Number(input.offset ?? 0));
   params.push(limit, offset);
   const { rows } = await pool.query(
-    `SELECT a.*, s.name AS staff_name, sv.name AS service_name, st.name AS store_name
+    `SELECT a.*,
+            COALESCE(s.name, '')  AS staff_name,
+            COALESCE(sv.name, '') AS service_name,
+            COALESCE(st.name, '') AS store_name
      FROM appointments a
-     JOIN staff s ON s.id = a.staff_id
-     JOIN services sv ON sv.id = a.service_id
-     JOIN stores st ON st.id = a.store_id
+     LEFT JOIN staff s    ON s.id  = a.staff_id
+     LEFT JOIN services sv ON sv.id = a.service_id
+     LEFT JOIN stores st  ON st.id = a.store_id
      WHERE ${conditions.join(' AND ')}
-     ORDER BY a.start_at DESC
+     ORDER BY a.created_at DESC, a.start_at DESC
      LIMIT $${params.length - 1} OFFSET $${params.length}`,
     params,
   );
@@ -313,6 +316,76 @@ export async function findStoreByName(name: string) {
     [`%${name.trim()}%`],
   );
   return rows[0] ? mapStore(rows[0]) : undefined;
+}
+
+/** 门店名规一化：去空白/括号/引号并小写，用于稳健比对 */
+const normalizeStoreName = (value: string) =>
+  value.replace(/\s+/g, '').replace(/[（）()【】\[\]「」『』]/g, '').toLowerCase();
+
+/**
+ * 剥离门店名里的对话噪音前缀/后缀（LLM 转述用户话术时常混入）：
+ * "用户确认上海徐汇门店" → "上海徐汇门店"；"那就去上海徐汇门店吧" → "上海徐汇门店"。
+ * 只剥对话动词/指代词，绝不剥地名（"上海"是门店名的一部分）。
+ */
+export const stripStoreNameNoise = (value: string): string => {
+  let text = value.trim();
+  for (let i = 0; i < 4; i += 1) {
+    const next = text
+      .replace(/^(?:用户|顾客|客人|客户|他|她|我|我们)/, '')
+      .replace(/^(?:已经|已|最终|最后|然后|接着|所以|那么|那|就说|说|讲|提到)?(?:确认|选定|选择|选了|挑选|挑了|确定|敲定|决定|定了|就选|就要|想要|想去|想约|要去|会去|选|定)/, '')
+      .replace(/^(?:的话|就是|就|是|在|去|到|约|来)/, '')
+      .replace(/^(?:说|讲)/, '')
+      .replace(/(?:吧|呗|哦|呢|了)+$/, '')
+      .replace(/(?:。|，|,|；|;|！|!|？|\?|、)+$/g, '')
+      .trim();
+    if (next === text) break;
+    text = next;
+  }
+  return text;
+};
+
+/**
+ * 稳健门店解析（note 兜底回收与服务层解析共用）：
+ *  1) 规一化精确匹配 → 2) 门店名包含文本（ILIKE 语义）→ 3) 反向包含：文本包含门店全名
+ *     （"用户确认上海徐汇门店" 命中 "上海徐汇门店"）→ 4) 去「门店/店」后缀的模糊匹配
+ *     （"徐汇店" 命中 "上海徐汇门店"）。
+ * 仅在在营门店中匹配；同名多店时按名称稳定排序取第一。
+ */
+export async function findStoreByNameFlexible(text: string): Promise<Store | undefined> {
+  const raw = stripStoreNameNoise(text);
+  if (!raw) return undefined;
+  const { rows } = await pool.query(
+    `SELECT
+       st.*,
+       COALESCE(array_agg(ss.service_id) FILTER (WHERE ss.service_id IS NOT NULL), '{}') AS service_ids
+     FROM stores st
+     LEFT JOIN store_services ss ON ss.store_id = st.id
+     WHERE st.is_active = true
+     GROUP BY st.id
+     ORDER BY st.name ASC, st.id ASC
+     LIMIT 100`,
+  );
+  const stores = rows.map(mapStore);
+  const nText = normalizeStoreName(raw);
+  if (!nText) return undefined;
+  const exact = stores.find((store) => normalizeStoreName(store.name) === nText);
+  if (exact) return exact;
+  const contains = stores.find((store) => normalizeStoreName(store.name).includes(nText));
+  if (contains) return contains;
+  const reverse = stores.find((store) => {
+    const nName = normalizeStoreName(store.name);
+    return nName.length >= 2 && nText.includes(nName);
+  });
+  if (reverse) return reverse;
+  const bareText = nText.replace(/(门店|分店|店)$/u, '');
+  if (bareText.length >= 2) {
+    const fuzzy = stores.find((store) => {
+      const bareName = normalizeStoreName(store.name).replace(/(门店|分店|店)$/u, '');
+      return bareName.length >= 2 && (bareName.includes(bareText) || bareText.includes(bareName));
+    });
+    if (fuzzy) return fuzzy;
+  }
+  return undefined;
 }
 
 export async function listStaffSchedules(staffId: string, dateFrom: string, dateTo: string) {

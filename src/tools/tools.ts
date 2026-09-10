@@ -1,26 +1,21 @@
 import { z } from 'zod';
 import {
-  applyStaffWeeklySchedule,
   cancelAppointment,
   checkInAppointment,
   completeAppointment,
   confirmAppointment,
   createAppointment,
-  deleteDayStaffSchedules,
   getAppointmentByIdentifier,
   getAppointmentOverview,
   getMyAppointments,
   listAppointmentAudits,
   listAppointments,
   listBookingReferenceData,
-  listStaffAvailability,
-  listStoreScheduleGrid,
   listStoreServices,
   listStoreStaff,
   markNoShowAppointment,
   rescheduleAppointment,
   searchAvailableSlots,
-  upsertDayStaffSchedules,
 } from '../services/appointments.js';
 import { formatBeijing } from '../utils.js';
 import {
@@ -30,69 +25,30 @@ import {
 } from '../services/customer-identity.js';
 
 /**
- * 预约系统对外 MCP 工具（数字人可见面，HA 风格精简集）。
+ * 预约系统对外 MCP 工具（数字人可见面，精简集 5 工具）。
  *
- * 对外仅暴露 8 个通用工具：
- *  - list_booking_reference
- *  - list_store_services
- *  - list_store_staff
- *  - list_staff_availability
+ * 对外仅暴露 5 个通用工具：
+ *  - list_store_catalog  (resource=stores|services|staff 合并原 3 个 list 工具)
  *  - query_slots
  *  - query_bookings
  *  - manage_booking
  *  - manage_customer_session
  *
  * 设计原则与 HA 系统一致：数字人只看到少数通用动词，复杂业务用 action / resource / scope
- * 参数路由；内部所有能力（预约、取消、改期、签到、审计、管理查询等）全部保留，
- * 只是暴露面收敛，降低大模型工具选择成本。
+ * 参数路由；内部所有能力全部保留，只是暴露面收敛，降低大模型工具选择成本。
+ * 摘掉的 manage_staff_schedules / list_staff_availability 为店长后台场景，顾客侧
+ * 由 query_slots + manage_staff_schedules(action=list) 覆盖，不再对 LLM 暴露。
  */
 
-// ===== 参考数据查询 =====
+// ===== 目录查询（聚合 3 个旧 list 工具） =====
 
-export const listBookingReferenceInput = z.object({
-  resource: z.enum(['stores']).describe('要查询的资源类型：stores=门店列表'),
-  active_only: z.boolean().optional(),
+export const listStoreCatalogInput = z.object({
+  resource: z.enum(['stores', 'services', 'staff']).describe('目录资源：stores=门店列表；services=某店可约项目/价格（必传 store_id）；staff=某店员工/可做项目（必传 store_id）'),
+  store_id: z.string().optional().describe('门店 id（resource=services|staff 时必填）'),
+  service_id: z.string().optional().describe('按项目过滤可服务员工（仅 resource=staff 时可选）'),
   keyword: z.string().optional().describe('名称关键字过滤'),
   limit: z.number().int().min(1).max(100).optional(),
-}).describe('统一参考数据查询：门店列表。数字人需要先展示门店列表或做门店选择时调用');
-
-export const listStoreServicesInput = z.object({
-  store_id: z.string().min(1).describe('门店 id'),
-  keyword: z.string().optional().describe('名称关键字过滤'),
-  limit: z.number().int().min(1).max(100).optional(),
-}).describe('列出某门店可预约项目。数字人需要直接展示门店项目时调用');
-
-export const listStoreStaffInput = z.object({
-  store_id: z.string().min(1).describe('门店 id'),
-  service_id: z.string().min(1).optional().describe('按项目过滤可服务员工'),
-  keyword: z.string().optional().describe('名称关键字过滤'),
-  limit: z.number().int().min(1).max(100).optional(),
-}).describe('列出某门店员工及其可服务项目。数字人需要直接推荐员工时调用');
-
-export const listStaffAvailabilityInput = z.object({
-  staff_id: z.string().min(1).describe('员工 id'),
-  date_from: z.string().min(1).describe('排班查询开始日期 YYYY-MM-DD'),
-  date_to: z.string().min(1).describe('排班查询结束日期 YYYY-MM-DD'),
-}).describe('查询员工在指定日期范围内的排班。数字人需要直接看某员工班次时调用');
-
-// ===== 排班管理（管理后台 / 数字人店长） =====
-
-export const manageStaffSchedulesInput = z.object({
-  action: z.enum(['list', 'upsert_day', 'delete_day', 'apply_weekly']).describe('排班动作：list=查门店排班表；upsert_day=建/改某员工某天班次；delete_day=删某员工某天班次；apply_weekly=按周模板批量铺班'),
-  store_id: z.string().min(1).describe('门店 id'),
-  staff_id: z.string().min(1).optional().describe('员工 id（upsert_day / delete_day / apply_weekly 必填；list 可选过滤）'),
-  date: z.string().optional().describe('日期 YYYY-MM-DD（upsert_day / delete_day 必填）'),
-  date_from: z.string().optional().describe('开始日期 YYYY-MM-DD（list / apply_weekly 必填）'),
-  date_to: z.string().optional().describe('结束日期 YYYY-MM-DD（list / apply_weekly 必填）'),
-  shifts: z.array(z.object({
-    start: z.string().describe('班次开始 HH:mm，如 09:00'),
-    end: z.string().describe('班次结束 HH:mm，如 18:00'),
-    status: z.enum(['available', 'unavailable', 'break']).optional().describe('班次状态，默认 available 可约'),
-  })).optional().describe('班次列表（upsert_day / apply_weekly 必填），如 [{start:"09:00",end:"12:00"},{start:"13:00",end:"18:00"}]'),
-  weekdays: z.array(z.number().int().min(1).max(7)).optional().describe('每周几上班（apply_weekly 必填），1=周一 ... 7=周日'),
-  start: z.string().optional().describe('只删除该开始时间的班次 HH:mm（delete_day 可选，省略删全天）'),
-  operator: z.string().optional().describe('操作人（审计用）'),
-}).describe('员工排班管理。action=list 查门店某时段排班；upsert_day 按天建/改班次（一天可多班，覆盖式保存）；delete_day 删除某天班次；apply_weekly 把每周固定班铺到日期范围（只填空白天）。排班决定顾客可约时段：没排班的时间 query_slots 不会返回');
+}).describe('门店/项目/员工目录查询。查门店传 resource=stores；查价格/项目传 resource=services+store_id；查技师/可做项目传 resource=staff+store_id。数字人做【门店选择/项目价格/技师推荐】统一调此工具，不再分别找旧 list 工具。排班/档期请调 query_slots，预约请调 manage_booking');
 
 // ===== 可约时段查询 =====
 
@@ -101,7 +57,7 @@ export const querySlotsInput = z.object({
   service_name: z.string().min(1).optional().describe('项目名，如"小气泡"；数字人从用户话术中提取后传入，服务端自动解析'),
   store_id: z.string().min(1).optional().describe('门店 id。用户说的是某门店里的项目时优先传入，服务端会限制为该店可做项目'),
   store_name: z.string().min(1).optional().describe('门店名，如"上海徐汇门店"；用户直接说门店名时传入，服务端模糊解析为门店'),
-  date: z.string().min(1).describe('日期，格式 YYYY-MM-DD'),
+  date: z.string().optional().describe('日期：YYYY-MM-DD；也可直接传口语"今天/明天/后天/大后天/周X/9月9日"，服务端自动换算，无需自行推算今天几号'),
   preferred_staff_id: z.string().min(1).optional(),
   preferred_staff_name: z.string().min(1).optional().describe('员工名，如"李美容师"；用户指定服务员工时传入'),
 }).describe('查询指定服务在某天可预约的时段，返回可用员工与时间槽。完整校验链路：门店存在→门店开通该项目→门店有会做该项目的员工→员工当天有排班且时段未占用。【播报铁律】向用户播报时段一律使用 start_local/end_local（东八区本地时间，如"2026-09-09 10:00"就是上午十点），严禁自行换算或朗读 start_at/end_at（那是 UTC，朗读会把上午十点说成凌晨两点）。数字人把"我想预约某个项目"先转成可用时段时调用，随后用 manage_booking(action=create) 创建');
@@ -132,7 +88,7 @@ export const manageBookingInput = z.object({
   service_id: z.string().min(1).optional(),
   service_name: z.string().min(1).optional().describe('项目名，如"小气泡"。数字人从用户话术中提取后传入，服务端自动解析'),
   store_id: z.string().min(1).optional(),
-  store_name: z.string().min(1).optional().describe('门店名，如"上海徐汇门店"；用户直接说门店名时传入，服务端自动解析'),
+  store_name: z.string().min(1).optional().describe('门店名，如"上海徐汇门店"。【必须】用户回答的门店名填在这里，绝不填进 note；只填纯门店名，不带"用户确认"等转述前缀，服务端支持模糊匹配（"徐汇店"也可）。用户没说门店且系统有多家门店时先追问，单店场景可不传'),
   staff_id: z.string().min(1).optional(),
   staff_name: z.string().min(1).optional().describe('员工名，如"李美容师"；用户指定员工时传入，服务端在门店内按名字解析'),
   start_at: z.string().min(1).optional().describe('到店时间：必须是 query_slots 返回的某个时段的 start_at 原文（UTC ISO），或"YYYY-MM-DD HH:mm"（东八区本地时间）。严禁把用户说的本地时间换算后再传。从 query_slots 结果中获取'),
@@ -174,6 +130,13 @@ const missing = (fields: string[], suggestedQuestion: string) => ({
   message: '参数不完整，请先向用户追问缺失信息后再调用。',
   missing_fields: fields,
   suggested_question: suggestedQuestion,
+  /** 明确告诉 LLM 重试时把答案放进哪个参数，防止再次错放进 note 等字段 */
+  retry_hint: fields
+    .map((field) => {
+      const [primary] = field.split('|');
+      return `用户回答后请填入参数 ${primary}`;
+    })
+    .join('；'),
 });
 
 const requireFields = (input: unknown, fields: string[], suggestedQuestion: string) => {
@@ -189,67 +152,24 @@ const requireFields = (input: unknown, fields: string[], suggestedQuestion: stri
   return missingFields.length > 0 ? missing(missingFields, suggestedQuestion) : null;
 };
 
-const referenceHandler = async (input: unknown) => {
+/** 聚合目录 handler：resource 路由到原 3 个服务函数，服务层零改动 */
+const storeCatalogHandler = async (input: unknown) => {
   const resource = resourceOf(input);
-  if (resource !== 'stores') {
-    return { success: false, error_code: 'INVALID_ARGUMENT', message: `不支持的 resource: ${resource}，仅支持 stores` };
-  }
-  return listBookingReferenceData(only(input, ['active_only', 'keyword', 'limit']) as unknown as Parameters<typeof listBookingReferenceData>[0]);
-};
-
-const storeServicesHandler = async (input: unknown) => {
-  const required = requireFields(input, ['store_id'], '请先告诉我您想查询哪家门店的项目。');
-  if (required) return required;
-  return listStoreServices(only(input, ['store_id', 'keyword', 'limit']) as unknown as Parameters<typeof listStoreServices>[0]);
-};
-
-const storeStaffHandler = async (input: unknown) => {
-  const required = requireFields(input, ['store_id'], '请先告诉我您想查询哪家门店的员工。');
-  if (required) return required;
-  return listStoreStaff(only(input, ['store_id', 'service_id', 'keyword', 'limit']) as unknown as Parameters<typeof listStoreStaff>[0]);
-};
-
-const staffAvailabilityHandler = async (input: unknown) => {
-  const required = requireFields(input, ['staff_id', 'date_from', 'date_to'], '请先告诉我员工、开始日期和结束日期，我再帮您查排班。');
-  if (required) return required;
-  return listStaffAvailability(only(input, ['staff_id', 'date_from', 'date_to']) as unknown as Parameters<typeof listStaffAvailability>[0]);
-};
-
-/** 排班管理（管理后台/数字人店长场景）：查询、按天建改、删除、周模板铺班 */
-const manageSchedulesHandler = async (input: unknown) => {
-  const action = actionOf(input);
-  switch (action) {
-    case 'list': {
-      const required = requireFields(input, ['store_id', 'date_from', 'date_to'], '请告诉我门店和起止日期，我帮您查排班表。');
+  switch (resource) {
+    case 'stores':
+      return listBookingReferenceData(only(input, ['keyword', 'limit', 'active_only']) as unknown as Parameters<typeof listBookingReferenceData>[0]);
+    case 'services': {
+      const required = requireFields(input, ['store_id'], '请先告诉我您想查询哪家门店的项目。');
       if (required) return required;
-      return listStoreScheduleGrid(only(input, ['store_id', 'date_from', 'date_to', 'staff_id']) as unknown as Parameters<typeof listStoreScheduleGrid>[0]);
+      return listStoreServices(only(input, ['store_id', 'keyword', 'limit']) as unknown as Parameters<typeof listStoreServices>[0]);
     }
-    case 'upsert_day': {
-      const required = requireFields(input, ['store_id', 'staff_id', 'date'], '请告诉我门店、员工和日期，以及当天班次时间。');
+    case 'staff': {
+      const required = requireFields(input, ['store_id'], '请先告诉我您想查询哪家门店的员工。');
       if (required) return required;
-      const record = isRecord(input) ? input : {};
-      const rawShifts = Array.isArray(record.shifts) ? record.shifts : [];
-      if (rawShifts.length === 0) {
-        return missing(['shifts'], '请提供当天班次列表，如 shifts:[{start:"09:00",end:"18:00"}]；清空当天请用 action=delete_day');
-      }
-      return upsertDayStaffSchedules(only(input, ['store_id', 'staff_id', 'date', 'shifts', 'operator']) as unknown as Parameters<typeof upsertDayStaffSchedules>[0]);
-    }
-    case 'delete_day': {
-      const required = requireFields(input, ['store_id', 'staff_id', 'date'], '请告诉我门店、员工和要删除排班的日期。');
-      if (required) return required;
-      return deleteDayStaffSchedules(only(input, ['store_id', 'staff_id', 'date', 'start', 'operator']) as unknown as Parameters<typeof deleteDayStaffSchedules>[0]);
-    }
-    case 'apply_weekly': {
-      const required = requireFields(input, ['store_id', 'staff_id', 'date_from', 'date_to', 'weekdays'], '请告诉我门店、员工、日期范围和每周哪几天上班。');
-      if (required) return required;
-      const record = isRecord(input) ? input : {};
-      if (!Array.isArray(record.shifts) || record.shifts.length === 0) {
-        return missing(['shifts'], '请提供每周班次时间，如 shifts:[{start:"09:00",end:"18:00"}]');
-      }
-      return applyStaffWeeklySchedule(only(input, ['store_id', 'staff_id', 'date_from', 'date_to', 'weekdays', 'shifts', 'operator']) as unknown as Parameters<typeof applyStaffWeeklySchedule>[0]);
+      return listStoreStaff(only(input, ['store_id', 'service_id', 'keyword', 'limit']) as unknown as Parameters<typeof listStoreStaff>[0]);
     }
     default:
-      return { success: false, error_code: 'INVALID_ARGUMENT', message: `不支持的排班动作: ${action}（支持 list / upsert_day / delete_day / apply_weekly）` };
+      return { success: false, error_code: 'INVALID_ARGUMENT', message: `不支持的 resource: ${resource}，仅支持 stores/services/staff` };
   }
 };
 
@@ -319,16 +239,32 @@ const queryBookingsHandler = async (input: unknown) => {
   }
 };
 
+/** 剥离 note 里的对话噪音前缀（"用户确认/那就选/说去"等），与 queries.ts 保持一致 */
+const stripNotePrefix = (value: string): string => {
+  let text = value.trim();
+  for (let i = 0; i < 4; i += 1) {
+    const next = text
+      .replace(/^(?:用户|顾客|客人|客户|他|她|我|我们)/, '')
+      .replace(/^(?:已经|已|最终|最后|然后|接着|所以|那么|那|就说|说|讲|提到)?(?:确认|选定|选择|选了|挑选|挑了|确定|敲定|决定|定了|就选|就要|想要|想去|想约|要去|会去|选|定)/, '')
+      .replace(/^(?:的话|就是|就|是|在|去|到|约|来)/, '')
+      .replace(/^(?:说|讲)/, '')
+      .trim();
+    if (next === text) break;
+    text = next;
+  }
+  return text;
+};
+
 /**
  * 从 note 文本中回收被大模型错放的门店/项目/员工名（仅 create 入口调用）。
  *
  * 背景：工具 schema 已明确 store_name/service_name/staff_name 的语义，但 LLM
- * 偶发把"上海徐汇门店"整体塞进 note（观测于线上 17:45 连续三次 NEEDS_MORE_INFO）。
- * 这里做保守的正则回收：
- *   - 门店：note 中含「门店/店」结尾的片段，或整个 note 就是一个短名词时直接采用；
- *   - 项目/员工：仅当 note 能按常见分隔符拆出与缺失字段一一对应的短语时回收，
- *     拆不出来就不动，宁可让服务端返回 NEEDS_MORE_INFO 由数字人追问。
- * 回收后会把该片段从 note 中移除，避免创建出的预约备注里残留"门店名"这种噪音。
+ * 偶发把"上海徐汇门店"整体塞进 note（观测于线上 14:27 连续两次：一次完全未传
+ * store，一次 note="用户确认上海徐汇门店"）。原正则 /{2,12}?(?:门店)/ 从字符串
+ * 头部尝试导致把"用户确认上海徐汇门店"整体当门店名提取，进而
+ * ILIKE '%用户确认上海徐汇门店%' 查不到 → STORE_NOT_FOUND。
+ * 现改为：先剥噪音前缀，再取"含门店/店后缀的最后一段短语"（2-8字），
+ * 避免前缀污染；员工/项目回收同理仅在缺失时介入。
  */
 const recoverFieldsFromNote = (input: unknown): void => {
   if (!isRecord(input)) return;
@@ -340,23 +276,44 @@ const recoverFieldsFromNote = (input: unknown): void => {
     return value !== undefined && value !== null && String(value).trim() !== '';
   };
 
+  // 噪声剥离后的 note 用于匹配，避免"用户确认"被吞入门店名
+  const stripped = stripNotePrefix(note);
   let remainder = note;
 
-  // 门店名回收：优先匹配「XX门店/XX店」结构（如"上海徐汇门店"）
+  // 门店名回收：取 stripped 中最后一个「XX门店/XX分店/XX店」片段（2-8字前缀），
+  // 避免头部贪吃。例："用户确认上海徐汇门店"剥离后"上海徐汇门店" → 提取"上海徐汇门店"。
   if (!hasField('store_id') && !hasField('store_name')) {
-    const storeMatch = remainder.match(/([\u4e00-\u9fa5A-Za-z0-9]{2,12}?(?:门店|分店|店))/);
-    if (storeMatch) {
-      input.store_name = storeMatch[1];
-      remainder = remainder.replace(storeMatch[1], '').trim();
+    const storeCandidates = stripped.match(/[\u4e00-\u9fa5A-Za-z0-9]{2,8}(?:门店|分店|店)/g);
+    let storeName = storeCandidates ? storeCandidates[storeCandidates.length - 1] : null;
+    if (storeName) {
+      // 对匹配片段再剥一次噪音，兜住"用户说去XX店"这类整体被贪吃进片段的情况
+      // （剥离需重复至稳定：如"说去上海徐汇门店"需两轮才能剥干净）
+      for (let iter = 0; iter < 3; iter++) {
+        const cleaned = stripNotePrefix(storeName);
+        if (cleaned === storeName) break;
+        storeName = cleaned;
+      }
+      input.store_name = storeName;
+      // 从原 remainder 中移除匹配到的门店名（取最后一次出现）
+      const idx = remainder.lastIndexOf(storeName);
+      if (idx !== -1) remainder = `${remainder.slice(0, idx)}${remainder.slice(idx + storeName.length)}`.trim();
+      else if (storeCandidates && remainder.includes(storeCandidates[storeCandidates.length - 1])) {
+        const rawIdx = remainder.lastIndexOf(storeCandidates[storeCandidates.length - 1]);
+        remainder = `${remainder.slice(0, rawIdx)}${remainder.slice(rawIdx + storeCandidates[storeCandidates.length - 1].length)}`.trim();
+      }
+      // 残留的"用户/确认"等转述噪音一并清掉
+      remainder = stripNotePrefix(remainder).trim();
     }
   }
 
-  // 员工名回收：「李美容师 / 张技师 / 王店长」这类称谓结构
+  // 员工名回收：「李美容师 / 张技师 / 王店长」这类称谓结构（取最后一个）
   if (!hasField('staff_id') && !hasField('staff_name')) {
-    const staffMatch = remainder.match(/([\u4e00-\u9fa5]{1,3}(?:美容师|技师|理疗师|师傅|店长|顾问))/);
-    if (staffMatch) {
-      input.staff_name = staffMatch[1];
-      remainder = remainder.replace(staffMatch[1], '').trim();
+    const staffCandidates = remainder.match(/[\u4e00-\u9fa5]{1,3}(?:美容师|技师|理疗师|师傅|店长|顾问)/g);
+    const staffName = staffCandidates ? staffCandidates[staffCandidates.length - 1] : null;
+    if (staffName) {
+      input.staff_name = staffName;
+      const idx = remainder.lastIndexOf(staffName);
+      if (idx !== -1) remainder = `${remainder.slice(0, idx)}${remainder.slice(idx + staffName.length)}`.trim();
     }
   }
 
@@ -378,7 +335,7 @@ const recoverFieldsFromNote = (input: unknown): void => {
   }
 
   // 清理后的 note 写回（避免残留门店/员工噪音）；完全清空则删除字段
-  const cleaned = remainder.replace(/^(的|预约|，|,|。)+|(的|预约|，|,|。)+$/g, '').trim();
+  const cleaned = remainder.replace(/^(的|预约|，|,|。)+|(的|预约|，|,|。)+$/g, '').trim().replace(/\s{2,}/g, ' ');
   if (cleaned) {
     input.note = cleaned;
   } else {
@@ -409,8 +366,20 @@ const manageBookingHandler = async (input: unknown) => {
   };
   switch (action) {
     case 'create': {
-      const required = requireFields(input, ['service_id|service_name', 'store_id|store_name', 'staff_id|staff_name', 'start_at'], '请先补充项目、门店、员工和预约时间后再创建预约。');
-      if (required) return required;
+      // 门店在单店部署下可由服务端自动兜底（不追问），多店时服务端会返回 NEEDS_MORE_INFO + 候选门店，
+      // 故此处不在前置校验里强制要求 store，避免"只有一个门店却反复问哪家门店"的死循环
+      const required = requireFields(input, ['service_id|service_name', 'staff_id|staff_name', 'start_at'], '请先补充项目、员工和预约时间后再创建预约。');
+      if (required) {
+        const CREATE_FIELD_QUESTIONS: Record<string, string> = {
+          'service_id|service_name': '请问您想预约哪个项目？',
+          'staff_id|staff_name': '请问您有指定的工作人员吗？没有的话我为您安排即可。',
+          'start_at': '请问您想预约哪一天、大概几点？',
+        };
+        const fields = (required as { missing_fields?: string[] }).missing_fields ?? [];
+        const questions = fields.map((field) => CREATE_FIELD_QUESTIONS[field]).filter(Boolean);
+        if (questions.length > 0) (required as { suggested_question: string }).suggested_question = questions.join(' ');
+        return required;
+      }
       return speak(await createAppointment(only(input, ['service_id', 'service_name', 'store_id', 'store_name', 'staff_id', 'staff_name', 'start_at', 'customer_name', 'customer_phone', 'customer_id', 'note', 'idempotency_key']) as unknown as Parameters<typeof createAppointment>[0]));
     }
     case 'cancel': {
@@ -481,34 +450,10 @@ const manageCustomerSessionHandler = async (input: unknown) => {
 
 export const appointmentTools = [
   {
-    name: 'list_booking_reference',
-    description: '统一参考数据查询：门店列表。数字人需要先展示门店列表或做门店选择时调用。',
-    inputSchema: listBookingReferenceInput,
-    handler: referenceHandler,
-  },
-  {
-    name: 'list_store_services',
-    description: '列出某门店可预约项目。数字人需要直接展示门店项目时调用。',
-    inputSchema: listStoreServicesInput,
-    handler: storeServicesHandler,
-  },
-  {
-    name: 'list_store_staff',
-    description: '列出某门店员工及其可服务项目。数字人需要直接推荐员工时调用。',
-    inputSchema: listStoreStaffInput,
-    handler: storeStaffHandler,
-  },
-  {
-    name: 'list_staff_availability',
-    description: '查询员工在指定日期范围内的排班。数字人需要直接看某员工班次时调用。',
-    inputSchema: listStaffAvailabilityInput,
-    handler: staffAvailabilityHandler,
-  },
-  {
-    name: 'manage_staff_schedules',
-    description: '员工排班管理（店长场景）。action=list 查门店排班表；upsert_day 建/改某员工某天班次；delete_day 删除；apply_weekly 按周模板铺班。排班决定顾客可约时段。',
-    inputSchema: manageStaffSchedulesInput,
-    handler: manageSchedulesHandler,
+    name: 'list_store_catalog',
+    description: '门店/项目/员工目录查询。resource=stores 查门店列表；resource=services+store_id 查某店项目/价格（用户说"背部管理多少钱/有哪些项目"时调）；resource=staff+store_id 查某店员工/可做项目（用户说"谁能做/换个技师"时调）。排班/档期请调 query_slots。',
+    inputSchema: listStoreCatalogInput,
+    handler: storeCatalogHandler,
   },
   {
     name: 'query_slots',

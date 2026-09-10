@@ -72,6 +72,18 @@ const registerTools = (server: McpServer, identity: ParsedIdentity) => {
     server.tool(tool.name, tool.description, tool.inputSchema.shape, async (input: unknown) => {
       const args = (input ?? {}) as Record<string, unknown>;
 
+      // 工具执行统一兜底：handler 抛出的异常（如 INVALID_DATE）必须转成结构化
+      // JSON 返回给 LLM。裸异常文本会被 SDK 当作 tool result 原文下发，LLM 拿到
+      // 非法 JSON 后无法理解错误原因，只能反复重试同样错误 → 数字人「思考中」空回
+      // （线上复现：date:"明天" 直抛 INVALID_DATE 裸文本）。
+      const runSafe = async (execute: () => Promise<unknown>) => {
+        try {
+          return await execute();
+        } catch (error) {
+          return wrapToolError(error);
+        }
+      };
+
       if (needsCustomerScope(tool.name, args)) {
         // 扫码直通：客户端已注入 X-Customer-Phone（小程序已确认的强身份）。
         // identifyCustomer 幂等：同手机号重复绑定为 no-op；不同顾客则顶替当前会话绑定。
@@ -102,7 +114,7 @@ const registerTools = (server: McpServer, identity: ParsedIdentity) => {
           agentCode: identity.agentCode,
           toolName: tool.name,
           args,
-          execute: () => tool.handler(withCustomer as never),
+          execute: () => runSafe(() => tool.handler(withCustomer as never)),
         });
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }], structuredContent: { data: result } };
       }
@@ -116,7 +128,7 @@ const registerTools = (server: McpServer, identity: ParsedIdentity) => {
         agentCode: identity.agentCode,
         toolName: tool.name,
         args,
-        execute: () => tool.handler(withAgent as never),
+        execute: () => runSafe(() => tool.handler(withAgent as never)),
       });
       return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }], structuredContent: { data: result } };
     });

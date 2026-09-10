@@ -16,7 +16,7 @@ import {
   countAppointmentOverview,
   computeAvailableSlots,
   findServiceByName,
-  findStoreByName,
+  findStoreByNameFlexible,
   getAppointment,
   getAppointmentByCode,
   getAppointmentDetailByCustomer,
@@ -69,7 +69,8 @@ const resolveService = async (input: { service_id?: string; service_name?: strin
   return undefined;
 };
 
-/** 用户直接说门店名（"上海徐汇门店"）→ 门店 id 解析；找不到抛业务错误结构 */
+/** 用户直接说门店名（"上海徐汇门店"）→ 门店 id 解析；找不到抛业务错误结构。
+ *  走稳健匹配（精确/包含/反向包含/去后缀模糊），LLM 混入"用户确认"等前缀也能命中。 */
 const resolveStoreOrError = async (input: { store_id?: string; store_name?: string }) => {
   if (input.store_id?.trim()) {
     const store = await getStore(input.store_id.trim());
@@ -77,11 +78,57 @@ const resolveStoreOrError = async (input: { store_id?: string; store_name?: stri
     return { store, error: null };
   }
   if (input.store_name?.trim()) {
-    const store = await findStoreByName(input.store_name.trim());
-    if (!store) return { store: undefined, error: { success: false as const, error_code: 'STORE_NOT_FOUND', message: `未找到名称包含「${input.store_name.trim()}」的门店，可先调用 list_booking_reference 查门店列表` } };
+    const store = await findStoreByNameFlexible(input.store_name.trim());
+    if (!store) {
+      const activeStores = await listStores(true, undefined, 8);
+      return {
+        store: undefined,
+        error: {
+          success: false as const,
+          error_code: 'STORE_NOT_FOUND',
+          message: `未找到「${input.store_name.trim()}」对应的门店。可先调用 list_store_catalog(resource=stores) 查门店列表后再重试`,
+          ...(activeStores.length > 0 ? { available_stores: activeStores.map((st) => ({ id: st.id, name: st.name })) } : {}),
+        },
+      };
+    }
     return { store, error: null };
   }
   return { store: undefined, error: null };
+};
+
+/**
+ * 门店解析 + 单店自动兜底：
+ *  - 完全未传门店且系统只有一家在营门店时直接采用（消灭单店部署"反复追问哪家门店"的死循环，
+ *    该问题源自 LLM 多次把门店名漏传/错放进 note，单店场景下追问毫无信息增益）；
+ *  - 多家门店时返回 NEEDS_MORE_INFO 并附门店清单，让数字人问出"是A店还是B店"的具体问题；
+ *  - 用户显式传了 store_id/store_name 但解析失败时，仍按 STORE_NOT_FOUND 报错（不静默改写）。
+ */
+const resolveStoreWithAutoDefault = async (input: { store_id?: string; store_name?: string }) => {
+  const resolved = await resolveStoreOrError(input);
+  if (resolved.error || resolved.store) return { ...resolved, autoSelected: false as const };
+  const activeStores = await listStores(true, undefined, 8);
+  if (activeStores.length === 1) {
+    return { store: activeStores[0], error: null, autoSelected: true as const };
+  }
+  if (activeStores.length === 0) {
+    return {
+      store: undefined,
+      error: { success: false as const, error_code: 'STORE_NOT_FOUND', message: '系统尚未配置在营门店，请先在管理后台添加门店' },
+      autoSelected: false as const,
+    };
+  }
+  return {
+    store: undefined,
+    error: {
+      success: false as const,
+      error_code: 'NEEDS_MORE_INFO',
+      message: '该品牌有多家在营门店，请先向用户确认到店门店后再创建预约。',
+      missing_fields: ['store_id|store_name'],
+      stores: activeStores.map((st) => ({ id: st.id, name: st.name })),
+      suggested_question: `请问您想到哪家门店？目前在营门店有：${activeStores.map((st) => st.name).join('、')}`,
+    },
+    autoSelected: false as const,
+  };
 };
 
 /** 预约定位：优先 appointment_id，其次 appointment_code（数字人对话中常拿到预约码）。 */
@@ -165,8 +212,8 @@ export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
 > {
   assertNonEmpty(input.date, 'date');
   const date = normalizeDate(input.date);
-  // 先解析门店（支持门店名），再在门店范围内解析项目，保证"门店有这个项目"的链路顺序
-  const { store, error: storeError } = await resolveStoreOrError(input);
+  // 先解析门店（支持门店名 + 单店自动兜底），再在门店范围内解析项目，保证"门店有这个项目"的链路顺序
+  const { store, error: storeError, autoSelected: storeAutoSelected } = await resolveStoreWithAutoDefault(input);
   if (storeError) return storeError;
   const storeId = store?.id ?? input.store_id?.trim();
   const service = await resolveService({ ...input, store_id: storeId });
@@ -225,6 +272,7 @@ export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
     success: true,
     service: { id: service.id, name: service.name, duration_minutes: service.duration_minutes },
     ...(store ? { store: { id: store.id, name: store.name } } : {}),
+    ...(storeAutoSelected ? { store_auto_selected: true } : {}),
     slots,
     has_slots: slots.length > 0,
     suggestion: slots.length > 0
@@ -251,8 +299,8 @@ const dayjsAddDays = (date: string, days: number) => {
 };
 
 export async function createAppointment(input: CreateAppointmentInput) {
-  // 先解析门店（支持门店名），项目解析限定在门店可做范围内
-  const { store, error: storeError } = await resolveStoreOrError(input);
+  // 先解析门店（支持门店名 + 单店自动兜底），项目解析限定在门店可做范围内
+  const { store, error: storeError, autoSelected: storeAutoSelected } = await resolveStoreWithAutoDefault(input);
   if (storeError) return storeError;
   const storeId = store?.id ?? input.store_id?.trim();
   if (!storeId) {
@@ -333,6 +381,7 @@ export async function createAppointment(input: CreateAppointmentInput) {
       appointment: existingAppointment,
       deduplicated: true,
       spoken: { time: formatBeijing(existingAppointment.start_at), booking_code: existingAppointment.appointment_code.slice(-8) },
+      ...(storeAutoSelected ? { store_auto_selected: true, store: { id: store.id, name: store.name } } : {}),
     };
   }
   // 取消/完成/爽约后同一时段重新预约 → 旧单已终结，换新幂等键（DB 唯一约束）正常建新单
@@ -370,6 +419,7 @@ export async function createAppointment(input: CreateAppointmentInput) {
         time: formatBeijing(startAt),
         booking_code: appointment.appointment_code.slice(-8),
       },
+      ...(storeAutoSelected ? { store_auto_selected: true, store: { id: store.id, name: store.name } } : {}),
     };
   } catch (error: any) {
     await client.query('ROLLBACK');

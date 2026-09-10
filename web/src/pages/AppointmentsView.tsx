@@ -59,12 +59,13 @@ export function AppointmentsView() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const query = {
-        status,
-        store_id: storeId,
-        keyword: keyword || undefined,
+      const query: Record<string, unknown> = {
+        limit: 50,
       };
-      const res = await api.appointments(query);
+      if (status) (query as Record<string, string>).status = status;
+      if (storeId) (query as Record<string, string>).store_id = storeId;
+      if (keyword.trim()) (query as Record<string, string>).keyword = keyword.trim();
+      const res = await api.appointments(query as Parameters<typeof api.appointments>[0]);
       setItems(res.items);
     } catch (error) {
       message.error(error instanceof Error ? error.message : '加载预约失败');
@@ -76,6 +77,11 @@ export function AppointmentsView() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => setListVersion((v) => v + 1), 30000);
+    return () => window.clearInterval(id);
+  }, []);
 
   const refresh = () => setListVersion((v) => v + 1);
 
@@ -177,13 +183,14 @@ export function AppointmentsView() {
           dataSource={items}
           loading={loading}
           size="middle"
-          scroll={{ x: 1000 }}
+          scroll={{ x: 1200 }}
+          pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: ['20', '50'] }}
           columns={[
             {
               title: '预约码',
               dataIndex: ['appointment', 'appointment_code'],
               width: 200,
-              render: (value: string) => <Typography.Text code>{value}</Typography.Text>,
+              render: (value: string) => <Typography.Text copyable code title={value}>{value}</Typography.Text>,
             },
             { title: '客户', dataIndex: ['appointment', 'customer_name'], width: 100 },
             { title: '手机号', dataIndex: ['appointment', 'customer_phone'], width: 130 },
@@ -194,7 +201,16 @@ export function AppointmentsView() {
               title: '开始时间',
               dataIndex: ['appointment', 'start_at'],
               width: 170,
+              sorter: (a, b) => +new Date(a.appointment.start_at) - +new Date(b.appointment.start_at),
               render: (value: string) => dayjs(value).format('YYYY-MM-DD HH:mm'),
+            },
+            {
+              title: '创建时间',
+              dataIndex: ['appointment', 'created_at'],
+              width: 170,
+              defaultSortOrder: 'descend' as const,
+              sorter: (a, b) => +new Date(a.appointment.created_at) - +new Date(b.appointment.created_at),
+              render: (value: string) => dayjs(value).format('YYYY-MM-DD HH:mm:ss'),
             },
             {
               title: '状态',
