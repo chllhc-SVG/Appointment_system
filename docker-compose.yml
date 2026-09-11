@@ -54,7 +54,7 @@ services:
       mcp.healthPath: "/healthz"
       mcp.transport: "streamable_http"
       mcp.url: "http://appointment-service:4020/mcp"
-      mcp.include_tools: "list_booking_reference,list_store_services,list_store_staff,list_staff_availability,manage_staff_schedules,query_slots,query_bookings,manage_booking,manage_customer_session"
+      mcp.include_tools: "list_store_catalog,query_slots,query_bookings,manage_booking,manage_customer_session"
 
   web:
     build:

@@ -22,7 +22,10 @@ import {
   endCustomerSession,
   getCurrentCustomer,
   identifyCustomer,
+  normalizePhone,
+  phoneHash,
 } from '../services/customer-identity.js';
+import { pool } from '../db/pool.js';
 
 /**
  * 预约系统对外 MCP 工具（数字人可见面，精简集 5 工具）。
@@ -69,6 +72,8 @@ export const queryBookingsInput = z.object({
   appointment_id: z.string().optional(),
   appointment_code: z.string().optional().describe('预约码，如 apt_20260616_...；查询 detail/audits 时优先用它定位'),
   customer_id: z.string().optional(),
+  customer_phone: z.string().optional().describe('顾客手机号（共享终端双重校验用；传了则必须与 customer_name 同时校验，不单独以手机号定人）'),
+  customer_name: z.string().optional().describe('顾客称呼（与 customer_phone 双重校验；防止同名/同号串号）'),
   store_id: z.string().optional(),
   staff_id: z.string().optional(),
   service_id: z.string().optional(),
@@ -79,7 +84,7 @@ export const queryBookingsInput = z.object({
   to_date: z.string().optional(),
   limit: z.number().int().min(1).max(100).optional(),
   offset: z.number().int().min(0).optional(),
-}).describe('查询预约：顾客预约列表、单条预约详情、审计轨迹、管理端列表与预约概览统计。数字人听到"查我的预约 / 预约详情 / 预约码是xxx / 门店预约统计"时调用。【播报铁律】向用户播报预约时间一律用 appointment.start_local（北京时间），严禁朗读 start_at（UTC，会把上午十点说成凌晨一点）；报预约码只报 appointment.booking_code 后8位，严禁朗读 appointment_code 全文或内部 id；严禁向用户索要任何编号/ID');
+}).describe('查询预约：顾客预约列表、单条预约详情、审计轨迹、管理端列表与预约概览统计。【双重校验】共享终端查询本人预约时以会话绑定为准；若 LLM 显式传入 customer_phone/customer_name 则必须两者一致才放行，单手机号或单名字不单独定人，放止同号/同名串号。【播报铁律】向用户播报预约时间一律用 appointment.start_local（北京时间），严禁朗读 start_at（UTC，会把上午十点说成凌晨一点）；报预约码只报 appointment.booking_code 后8位，严禁朗读 appointment_code 全文或内部 id；严禁向用户索要任何编号/ID');
 
 // ===== 预约动作 =====
 
@@ -211,8 +216,87 @@ function decorateAppointmentsForSpeech(result: unknown): unknown {
   return result;
 }
 
+/** 预约查询双重校验：手机号+姓名必须成对且一致，防同号/同名串号；未传则沿用会话绑定，不改原链路 */
+async function verifyBookingQueryIdentity(
+  input: unknown,
+  boundCustomerId?: string,
+): Promise<{ ok: true; verifiedCustomerId?: string } | { ok: false; error: Record<string, unknown> }> {
+  const record = isRecord(input) ? input : {};
+  const rawPhone = typeof record.customer_phone === 'string' ? record.customer_phone.trim() : '';
+  const rawName = typeof record.customer_name === 'string' ? record.customer_name.trim() : '';
+  const hasPhone = Boolean(rawPhone);
+  const hasName = Boolean(rawName);
+  if (!hasPhone && !hasName) return { ok: true };
+  if (hasPhone !== hasName) {
+    return {
+      ok: false,
+      error: {
+        success: false,
+        error_code: 'NEEDS_MORE_INFO',
+        message: '查询预约需手机号+姓名双重校验，二者需同时提供且为同一人，避免同号/同名串号。',
+        missing_fields: hasPhone ? ['customer_name'] : ['customer_phone'],
+        suggested_question: hasPhone ? '请再提供姓名（与该手机号一致）以完成双重校验。' : '请再提供手机号（与该姓名一致）以完成双重校验。',
+      },
+    };
+  }
+  try {
+    const normalized = normalizePhone(rawPhone);
+    const hash = phoneHash(normalized);
+    const { rows } = await pool.query(
+      'SELECT customer_id, display_name FROM customer_profiles WHERE phone_hash = $1 LIMIT 1',
+      [hash],
+    );
+    const profile = rows[0] as { customer_id: string; display_name: string | null } | undefined;
+    if (!profile) {
+      return {
+        ok: false,
+        error: { success: false, error_code: 'IDENTITY_MISMATCH', message: `手机号 ${rawPhone} 未找到对应顾客档案，请核对手机号。` },
+      };
+    }
+    const display = String(profile.display_name ?? '').trim();
+    const nameMatch = rawName === display || (display && (display.includes(rawName) || rawName.includes(display)));
+    if (!nameMatch) {
+      return {
+        ok: false,
+        error: {
+          success: false,
+          error_code: 'IDENTITY_MISMATCH',
+          message: `手机号与姓名不匹配（该手机号对应「${display || '未知'}」），请确认手机号与姓名为同一人后再试。`,
+        },
+      };
+    }
+    if (boundCustomerId && profile.customer_id !== boundCustomerId) {
+      return {
+        ok: false,
+        error: {
+          success: false,
+          error_code: 'IDENTITY_MISMATCH',
+          message: '传入的手机号/姓名与当前会话绑定的顾客不一致，请先通过 manage_customer_session 重新识别或直接用当前会话身份查询。',
+        },
+      };
+    }
+    // 双重校验通过：后续查询强制按该档案 id 作用域，避免 LLM 传错 customer_id 串号
+    (record as Record<string, unknown>).customer_id = profile.customer_id;
+    return { ok: true, verifiedCustomerId: profile.customer_id };
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes('IDENTIFY_INVALID_PHONE')) {
+      return { ok: false, error: { success: false, error_code: 'INVALID_ARGUMENT', message: msg } };
+    }
+    return { ok: false, error: { success: false, error_code: 'IDENTITY_MISMATCH', message: `双重校验失败：${msg}` } };
+  }
+}
+
 const queryBookingsHandler = async (input: unknown) => {
   const scope = scopeOf(input);
+  const boundId = isRecord(input) && typeof input.customer_id === 'string' ? String(input.customer_id).trim() || undefined : undefined;
+
+  // 需要顾客作用域的 scope 先做手机号+姓名双重校验（单字段不单独定人）
+  if (['my', 'detail', 'audits', 'list'].includes(scope)) {
+    const verified = await verifyBookingQueryIdentity(input, boundId);
+    if (!verified.ok) return verified.error;
+  }
+
   switch (scope) {
     case 'my':
       return decorateAppointmentsForSpeech(await getMyAppointments(only(input, ['customer_id', 'from_date', 'to_date', 'status', 'service_name', 'keyword']) as unknown as Parameters<typeof getMyAppointments>[0]));
