@@ -115,11 +115,16 @@ export function parseIdentity(req: { headers?: Record<string, string | string[] 
 /**
  * 顾客级工具（查询/创建/取消/改期/签到本人预约、顾客身份管理）的上下文解析。
  * 返回 needsIdentification=true 时工具层直接返回引导文案（fail-closed）。
+ *
+ * preResolvedSession：调用方在同一请求内已解析过的会话（如扫码直通路径里的
+ * getActiveSession 结果）。传入后跳过重复的 DB 解析（undefined=未解析，照常自查；
+ * null=已查过且无活跃会话）。省去每次工具调用 2 次多余 DB 往返。
  */
 export async function bindCustomerIdentity(
   input: Record<string, unknown>,
   identity: { agentCode?: string; sessionId?: string; customerPhone?: string; customerName?: string },
   resolveSessionCustomer: (agentCode: string, sessionId?: string) => Promise<{ customerId?: string } | null>,
+  preResolvedSession?: { customerId?: string } | null,
 ): Promise<BoundIdentity> {
   const mode: IdentityMode = (process.env.IDENTITY_MODE?.trim().toLowerCase() as IdentityMode) || 'personal';
 
@@ -138,8 +143,10 @@ export async function bindCustomerIdentity(
     return { customerId: identity.agentCode, agentCode: identity.agentCode, sessionId: identity.sessionId, needsIdentification: false, mode };
   }
 
-  // shared 模式：顾客身份只来自顾客会话，不信任 LLM 传入的 customer_id
-  const session = await resolveSessionCustomer(identity.agentCode, identity.sessionId);
+  // shared 模式：顾客身份只来自顾客会话，不信任 LLM 传入的 customer_id。
+  // preResolvedSession 非 undefined 时直接复用调用方已解析的结果（扫码直通路径
+  // 已查过一次），避免同一请求重复 2 次 DB 往返；undefined 时保持原自查语义。
+  const session = preResolvedSession !== undefined ? preResolvedSession : await resolveSessionCustomer(identity.agentCode, identity.sessionId);
   if (!session?.customerId) {
     return { customerId: undefined, agentCode: identity.agentCode, sessionId: identity.sessionId, needsIdentification: true, mode };
   }

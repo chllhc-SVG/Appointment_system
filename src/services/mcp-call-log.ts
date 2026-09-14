@@ -51,8 +51,13 @@ const safeStringify = (value: unknown): string => {
 };
 
 /**
- * 记录一次 MCP 工具调用：先入内存缓冲（即时可见），再异步写库（失败不阻塞调用方）。
+ * 记录一次 MCP 工具调用：先入内存缓冲（即时可见），再异步写库。
  * 参数/结果序列化失败时降级为占位符，保证日志写入永不抛错。
+ *
+ * 写库必须 fire-and-forget（void，不 await）：mcp-call-log 的 INSERT 与工具 handler
+ * 共用同一个 pg 连接池。容器冷启动/并发高峰时池子打满，await 写库会让工具响应
+ * 串行等待"日志落库"——实测这就是"mcp 日志几十ms、用户体感几秒"的差值来源之一。
+ * 调用方 wrapToolCall 内同样只 void，不改返回语义。
  */
 export async function recordMcpCall(input: NewMcpCallLog): Promise<void> {
   const log = pushBuffer(box(input));

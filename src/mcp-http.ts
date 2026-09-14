@@ -35,6 +35,10 @@ const trace = (event: Omit<TraceEvent, 'id' | 'timestamp'>) => {
  *
  * 注意：manage_customer_session 是身份管理工具，必须放行（先建立身份，再查询/结束身份），
  * 只有消费顾客预约数据的工具才需要 fail-closed。
+ *
+ * 性能铁律：本模块每条 tools/call 走「扫码直通判断（若干 DB 往返）+ 身份自查 +
+ * handler 内 N 次 DB 串行」的全链路。诊断慢调用时按「identity(扫码判定+getScan+) →
+ * bind(会话自查) → handler → log」的分段计时看，不要只看总耗时猜。
  */
 // HA 风格精简集：顾客级工具（未识别顾客时 fail-closed 返回 IDENTITY_REQUIRED）
 const CUSTOMER_SCOPED_TOOLS = new Set([
@@ -87,21 +91,36 @@ const registerTools = (server: McpServer, identity: ParsedIdentity) => {
       if (needsCustomerScope(tool.name, args)) {
         // 扫码直通：客户端已注入 X-Customer-Phone（小程序已确认的强身份）。
         // identifyCustomer 幂等：同手机号重复绑定为 no-op；不同顾客则顶替当前会话绑定。
+        // 顶替判断必须并行：getActiveSession 与 getScanCustomerId 互不依赖，
+        // 原串行写法白白多等一个 DB 往返（慢调用里可观测的固定 +30~80ms）。
+        // 预解析的活跃会话向下传递给 bindCustomerIdentity 复用，避免同一请求
+        // 重复解析（原路径一次工具调用要打 4~5 次 DB：getActiveSession×2 +
+        // getScanCustomerId + touchSession，是工具耗时里"看不见的大头"）。
+        let preResolved: { customerId?: string } | null | undefined;
         if (identity.customerPhone?.trim() && identity.agentCode) {
-          const current = await getActiveSession(identity.agentCode, identity.sessionId);
-          const sameCustomer = current && current.source === 'scan' && current.customer_id === (await getScanCustomerId(identity.customerPhone));
+          const agentCode = identity.agentCode;
+          const sessionId = identity.sessionId;
+          const phone = identity.customerPhone;
+          const [current, scanCustomerId] = await Promise.all([
+            getActiveSession(agentCode, sessionId),
+            getScanCustomerId(phone),
+          ]);
+          preResolved = current ? { customerId: current.customer_id } : null;
+          const sameCustomer = current && current.source === 'scan' && current.customer_id === scanCustomerId;
           if (!sameCustomer) {
             await identifyCustomer({
-              agent_code: identity.agentCode,
-              customer_phone: identity.customerPhone,
+              agent_code: agentCode,
+              customer_phone: phone,
               customer_name: identity.customerName || undefined,
-              external_session_id: identity.sessionId,
+              external_session_id: sessionId,
               source: 'scan',
             });
+            // 顶替/新建会话后旧快照失效，回退为让 bindCustomerIdentity 自查
+            preResolved = undefined;
           }
         }
 
-        const bound = await bindCustomerIdentity(args, identity, resolveSessionCustomer);
+        const bound = await bindCustomerIdentity(args, identity, resolveSessionCustomer, preResolved);
         if (bound.needsIdentification) {
           return {
             content: [{ type: 'text' as const, text: JSON.stringify(IDENTITY_REQUIRED_RESULT, null, 2) }],
@@ -116,7 +135,7 @@ const registerTools = (server: McpServer, identity: ParsedIdentity) => {
           args,
           execute: () => runSafe(() => tool.handler(withCustomer as never)),
         });
-        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }], structuredContent: { data: result } };
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result) }], structuredContent: { data: result } };
       }
 
       // 身份管理工具与非顾客级工具：注入 agent 上下文（operator/agent_code），不改写 customer_id
@@ -130,7 +149,7 @@ const registerTools = (server: McpServer, identity: ParsedIdentity) => {
         args,
         execute: () => runSafe(() => tool.handler(withAgent as never)),
       });
-      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }], structuredContent: { data: result } };
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result) }], structuredContent: { data: result } };
     });
   }
 };
@@ -194,22 +213,33 @@ const handleLegacyJsonRpc = async (req: Request, body: Record<string, unknown>) 
         let executeArgs: Record<string, unknown> = args;
 
         if (needsCustomerScope(tool.name, args)) {
-          // 扫码直通：identifyCustomer 幂等——同手机号 no-op，不同顾客顶替当前会话绑定
+          // 扫码直通（与 StreamableHTTP 路径同一优化）：预解析会话复用，省重复 DB 往返。
+          // 顶替判断两个查询互不依赖，并行发起（原串行多等一个 DB 往返）。
+          let preResolved: { customerId?: string } | null | undefined;
           if (identity.customerPhone?.trim() && identity.agentCode) {
-            const current = await getActiveSession(identity.agentCode, identity.sessionId);
-            const sameCustomer = current && current.source === 'scan' && current.customer_id === (await getScanCustomerId(identity.customerPhone));
+            const agentCode = identity.agentCode;
+            const sessionId = identity.sessionId;
+            const phone = identity.customerPhone;
+            const [current, scanCustomerId] = await Promise.all([
+              getActiveSession(agentCode, sessionId),
+              getScanCustomerId(phone),
+            ]);
+            preResolved = current ? { customerId: current.customer_id } : null;
+            const sameCustomer = current && current.source === 'scan' && current.customer_id === scanCustomerId;
             if (!sameCustomer) {
               await identifyCustomer({
-                agent_code: identity.agentCode,
-                customer_phone: identity.customerPhone,
+                agent_code: agentCode,
+                customer_phone: phone,
                 customer_name: identity.customerName || undefined,
-                external_session_id: identity.sessionId,
+                external_session_id: sessionId,
                 source: 'scan',
               });
+              // 顶替/新建会话后旧快照失效，回退为让 bindCustomerIdentity 自查
+              preResolved = undefined;
             }
           }
 
-          const bound = await bindCustomerIdentity(args, identity, resolveSessionCustomer);
+          const bound = await bindCustomerIdentity(args, identity, resolveSessionCustomer, preResolved);
           if (bound.needsIdentification) {
             trace({ transport: 'sse', agentCode: identity.agentCode, method, toolName, ok: true, error: 'identity_required' });
             return jsonRpcResult(id, IDENTITY_REQUIRED_RESULT);

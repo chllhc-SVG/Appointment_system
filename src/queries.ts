@@ -546,8 +546,16 @@ export async function listStaffSkillsForService(serviceId: string, storeId?: str
   return rows.map(mapStaff);
 }
 
-export async function searchAvailableTimeSlots(serviceId: string, storeId: string | undefined, date: string, preferredStaffId?: string): Promise<TimeSlot[]> {
-  const service = await getService(serviceId);
+export async function searchAvailableTimeSlots(
+  serviceId: string,
+  storeId: string | undefined,
+  date: string,
+  preferredStaffId?: string,
+  precomputed?: { service?: Service },
+): Promise<TimeSlot[]> {
+  // precomputed.service：上层 searchAvailableSlots 已解析过同 service_id，直接复用，
+  // 省掉一次 DB 往返（同 id 同请求内结果一致，无状态漂移）。
+  const service = precomputed?.service ?? await getService(serviceId);
   if (!service) return [];
   const staffList = preferredStaffId
     ? [await getStaff(preferredStaffId)].filter(Boolean) as Staff[]

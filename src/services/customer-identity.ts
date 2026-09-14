@@ -81,21 +81,55 @@ export const normalizePhone = (value: string) => {
   return trimmed;
 };
 
-/** 滑动续期：每次命中活跃会话时延长 TTL，最多延到 now + TTL（封顶 MAX_TTL_MS）。 */
+/**
+ * 滑动续期：每次命中活跃会话时延长 TTL，最多延到 now + TTL（封顶 MAX_TTL_MS）。
+ * 节流：同一会话 60s 内不重复 UPDATE。续期是"近似滑动"语义，一分钟粒度完全够用
+ * （TTL 默认 30min）；原实现每次解析都打一次 UPDATE，把每次工具调用白白垫高
+ * 一个 DB 写往返。
+ */
+const SESSION_TOUCH_THROTTLE_MS = 60_000;
+const sessionTouchAt = new Map<string, number>();
+
 const touchSession = async (sessionId: string) => {
-  await pool.query(
-    `UPDATE customer_sessions
-     SET expires_at = LEAST(now() + make_interval(secs => $2), now() + make_interval(secs => $3)),
-         updated_at = now()
-     WHERE id = $1 AND status = 'active'`,
-    [sessionId, CUSTOMER_SESSION_TTL_MS / 1000, MAX_TTL_MS / 1000],
-  );
+  const now = Date.now();
+  const last = sessionTouchAt.get(sessionId) ?? 0;
+  if (now - last < SESSION_TOUCH_THROTTLE_MS) return;
+  sessionTouchAt.set(sessionId, now);
+  // 有界：超 512 条时按 last-touch 时间戳删最旧的一批（高峰并发下只记活跃会话，
+  // 而不是把 Map 撑爆；被删 key 的下次调用只多付 1 次 UPDATE，可接受）。
+  if (sessionTouchAt.size > 512) {
+    const cutoff = now - SESSION_TOUCH_THROTTLE_MS;
+    for (const [key, ts] of sessionTouchAt) {
+      if (ts <= cutoff) sessionTouchAt.delete(key);
+    }
+    while (sessionTouchAt.size > 512) {
+      const oldest = sessionTouchAt.keys().next();
+      if (oldest.done) break;
+      sessionTouchAt.delete(oldest.value);
+    }
+  }
+  try {
+    await pool.query(
+      `UPDATE customer_sessions
+       SET expires_at = LEAST(now() + make_interval(secs => $2), now() + make_interval(secs => $3)),
+           updated_at = now()
+       WHERE id = $1 AND status = 'active'`,
+      [sessionId, CUSTOMER_SESSION_TTL_MS / 1000, MAX_TTL_MS / 1000],
+    );
+  } catch {
+    // 续期失败不影响本次调用：expires_at 尚有余额，下次解析会再续
+  }
 };
 
 /**
  * 获取活跃会话（带外部会话作用域）：
  * 优先 (agent, externalSessionId) 精确绑定；无外部会话 id 时退回 agent 级唯一活跃会话。
  * 过期会话顺带标记 expired；命中活跃会话时滑动续期。
+ *
+ * 热路径节流：命中为 null（新接待扫码中/未识别）时不做清扫 UPDATE——清扫走
+ * sweepExpiredSessions() 的后台兜底（5min 批量），避免每次未识别工具调用都多打
+ * 1 次写往返。数字人对话里 IDENTITY_REQUIRED 是高频返回，这个 UPDATE 原本是
+ * 把每次失败调用都垫高一个 DB 写往返的隐性元凶。
  */
 export async function getActiveSession(agentCode: string, externalSessionId?: string): Promise<CustomerSession | null> {
   const agent = agentCode?.trim();
@@ -114,12 +148,8 @@ export async function getActiveSession(agentCode: string, externalSessionId?: st
       await touchSession(row.id);
       return toSession(row);
     }
-    // 该外部会话没有自己的绑定 → 不回落 agent 级，避免并行对话互相串号
-    await pool.query(
-      `UPDATE customer_sessions SET status = 'expired', updated_at = now()
-       WHERE agent_code = $1 AND external_session_id = $2 AND status = 'active' AND expires_at <= now()`,
-      [agent, external],
-    );
+    // 该外部会话没有自己的绑定 → 不回落 agent 级，避免并行对话互相串号。
+    // 注：不在此清扫过期行（热路径写放大），由后台 sweepExpiredSessions 批量处理。
     return null;
   }
 
@@ -131,15 +161,26 @@ export async function getActiveSession(agentCode: string, externalSessionId?: st
   );
   const row = rows[0] as SessionRow | undefined;
   if (!row) {
-    await pool.query(
-      `UPDATE customer_sessions SET status = 'expired', updated_at = now()
-       WHERE agent_code = $1 AND status = 'active' AND expires_at <= now()`,
-      [agent],
-    );
+    // 同上：不清扫，交后台批量
     return null;
   }
   await touchSession(row.id);
   return toSession(row);
+}
+
+/** 后台兜底清扫：批量把过期活跃会话标 expired（每 5min 一次，见 main.ts）。
+ *  从热路径剥离后，过期标记最多延迟 5min——会话解析本来就带 expires_at > now()
+ *  条件，延迟清扫不影响正确性，只影响"管理后台看状态"的实时性（可接受）。 */
+export async function sweepExpiredSessions(): Promise<number> {
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE customer_sessions SET status = 'expired', updated_at = now()
+       WHERE status = 'active' AND expires_at <= now()`,
+    );
+    return rowCount ?? 0;
+  } catch {
+    return 0;
+  }
 }
 
 /** 按手机号查询顾客档案 id（不存在返回 null）。用于扫码直通幂等判断。 */

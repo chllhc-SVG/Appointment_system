@@ -137,6 +137,14 @@ export interface TimeSlot {
   end_local: string;
 }
 
+/** 对外精简时段：只保留口播 + 回填字段，数十KB pretty-JSON 压到 1/3，
+ *  不改 TimeSlot 内部语义（computeAvailableSlots 照算照存）。 */
+export interface CompactTimeSlot {
+  staff_name: string;
+  start_local: string;
+  start_at: string;
+}
+
 export interface CreateAppointmentInput {
   service_id?: string;
   store_id?: string;

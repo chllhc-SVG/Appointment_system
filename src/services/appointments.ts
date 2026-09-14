@@ -6,15 +6,15 @@ import type {
   Appointment,
   AppointmentStatus,
   CancelAppointmentInput,
+  CompactTimeSlot,
   CreateAppointmentInput,
   QueryAppointmentsInput,
   RescheduleAppointmentInput,
   SearchSlotsInput,
-  TimeSlot,
+  Staff,
 } from '../types.js';
 import {
   countAppointmentOverview,
-  computeAvailableSlots,
   findServiceByName,
   findStoreByNameFlexible,
   getAppointment,
@@ -27,12 +27,12 @@ import {
   listAppointmentsByCustomer,
   listAppointmentsByFilters,
   listAvailableScheduleDates,
-  listBusyAppointments,
   listStaffSkillsForService,
   listServices,
   listStaff,
   listStores,
   listStaffSchedules,
+  listStaffSchedulesBulk,
   searchAvailableTimeSlots,
 } from '../queries.js';
 import { deleteDaySchedules, listStoreSchedules, upsertDaySchedules, applyWeeklyScheduleTemplate } from './catalog.js';
@@ -207,7 +207,7 @@ function assertCustomerIdentity(customerId: string | undefined) {
 }
 
 export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
-  | { success: true; service: { id: string; name: string; duration_minutes: number }; store?: { id: string; name: string }; slots: TimeSlot[]; has_slots: boolean; suggestion?: { reason: string; message: string; dates?: string[] } }
+  | { success: true; service: { id: string; name: string; duration_minutes: number }; store?: { id: string; name: string }; slots: CompactTimeSlot[]; has_slots: boolean; suggestion?: { reason: string; message: string; dates?: string[] } }
   | { success: false; error_code: string; message: string }
 > {
   assertNonEmpty(input.date, 'date');
@@ -230,10 +230,17 @@ export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
     if (scopeError) return scopeError;
   }
 
-  // 支持按员工名指定（"想让李美容师服务"）
+  // 支持按员工名指定（"想让李美容师服务"）。技能列表缓存：空档兜底分支要复用，
+  // 避免同一请求内 listStaffSkillsForService 被重复拉 2~3 次。
+  let skillsCache: Staff[] | null = null;
+  const getSkilledStaff = async (): Promise<Staff[]> => {
+    skillsCache ??= await listStaffSkillsForService(service.id, storeId);
+    return skillsCache;
+  };
+
   let preferredStaffId = input.preferred_staff_id?.trim();
   if (!preferredStaffId && input.preferred_staff_name?.trim()) {
-    const staffList = await listStaffSkillsForService(service.id, storeId);
+    const staffList = await getSkilledStaff();
     const matched = staffList.find((staff) => staff.name === input.preferred_staff_name?.trim())
       ?? staffList.find((staff) => staff.name.includes(input.preferred_staff_name!.trim()));
     if (!matched) {
@@ -242,20 +249,25 @@ export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
     preferredStaffId = matched.id;
   }
 
-  const slots = await searchAvailableTimeSlots(service.id, storeId, date, preferredStaffId);
+  // service 由外层解析直接传入（precomputed），省掉 searchAvailableTimeSlots 内部的重复 getService
+  const slots = await searchAvailableTimeSlots(service.id, storeId, date, preferredStaffId, { service });
   let reason = 'NO_AVAILABLE_SLOTS';
   let suggestionDates: string[] | undefined;
   if (slots.length === 0) {
     // 区分"没排班"与"排班已满"，帮数字人给出不同的追问话术
-    const skilledStaff = await listStaffSkillsForService(service.id, storeId);
+    const skilledStaff = await getSkilledStaff();
     const targetStaff = preferredStaffId
       ? skilledStaff.filter((item) => item.id === preferredStaffId)
       : skilledStaff;
-    const anyScheduled = targetStaff.length > 0 &&
-      (await Promise.all(targetStaff.map(async (staff) => {
-        const schedules = await listStaffSchedules(staff.id, `${date}T00:00:00+08:00`, `${date}T23:59:59+08:00`);
-        return schedules.filter((schedule) => schedule.status === 'available').length > 0;
-      }))).some(Boolean);
+    // 一次批量查询替代逐员工 N+1（原实现每人一次 listStaffSchedules）
+    const anyScheduled = targetStaff.length > 0 && await (async () => {
+      const schedules = await listStaffSchedulesBulk(
+        targetStaff.map((staff) => staff.id),
+        `${date}T00:00:00+08:00`,
+        `${date}T23:59:59+08:00`,
+      );
+      return schedules.some((schedule) => schedule.status === 'available');
+    })();
     if (targetStaff.length === 0) {
       reason = 'NO_SKILLED_STAFF';
     } else if (!anyScheduled) {
@@ -273,7 +285,16 @@ export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
     service: { id: service.id, name: service.name, duration_minutes: service.duration_minutes },
     ...(store ? { store: { id: store.id, name: store.name } } : {}),
     ...(storeAutoSelected ? { store_auto_selected: true } : {}),
-    slots,
+    // 精简 slots：每个 (员工, 开始时间) 只保留 1 个字段。原 7 字段/时段（含 UTC+本地
+    // 双时间 + staff_id）在高峰日可达数十 KB pretty-JSON，是"mcp 日志几十 ms、
+    // 用户体感几秒"的最大元凶——大载荷直接拖慢 LLM 的 tool-result 解析与二次生成。
+    // end_local 可由 start_local+duration_minutes 推导；start_at/end_at 仍传原文
+    // 供 manage_booking(action=create) 回填 start_at 用。
+    slots: slots.map((slot) => ({
+      staff_name: slot.staff_name,
+      start_local: slot.start_local,
+      start_at: slot.start_at,
+    })),
     has_slots: slots.length > 0,
     suggestion: slots.length > 0
       ? undefined
@@ -317,12 +338,16 @@ export async function createAppointment(input: CreateAppointmentInput) {
   if (!store) {
     return { success: false, error_code: 'STORE_NOT_FOUND', message: '门店不存在或已停用' };
   }
-  // 员工解析：优先 staff_id，其次在门店内按 staff_name 解析（用户说"让李美容师服务"）
+  // 员工解析：优先 staff_id，其次在门店内按 staff_name 解析（用户说"让李美容师服务"）。
+  // 技能校验与员工是否存在无关，并行发起：getStaff/matched 与技能列表互不依赖。
+  // 原串行写法把「技能校验」排在员工解析之后，白白多等一个 DB 往返。
+  const staffName = input.staff_name?.trim();
+  const skillsPromise = listStaffSkillsForService(service.id, store.id);
   let staff = input.staff_id?.trim() ? await getStaff(input.staff_id.trim()) : undefined;
-  if (!staff && input.staff_name?.trim()) {
-    const storeStaff = await listStaff(store.id, undefined, input.staff_name.trim(), true, 100);
-    const matched = storeStaff.find((item) => item.name === input.staff_name?.trim())
-      ?? storeStaff.find((item) => item.name.includes(input.staff_name!.trim()));
+  if (!staff && staffName) {
+    const storeStaff = await listStaff(store.id, undefined, staffName, true, 100);
+    const matched = storeStaff.find((item) => item.name === staffName)
+      ?? storeStaff.find((item) => item.name.includes(staffName));
     staff = matched ? await getStaff(matched.id) : undefined;
   }
   if (!staff) return { success: false, error_code: 'NOT_FOUND', message: '员工不存在或已停用（可按 staff_id 或 staff_name 指定）' };
@@ -332,7 +357,7 @@ export async function createAppointment(input: CreateAppointmentInput) {
   const scopeError = await checkServiceInStoreScope(store, service);
   if (scopeError) return scopeError;
 
-  const staffSkills = await listStaffSkillsForService(service.id, store.id);
+  const staffSkills = await skillsPromise;
   if (!staffSkills.some((item) => item.id === staff.id)) {
     return { success: false, error_code: 'POLICY_DENIED', message: '该员工不支持此项目' };
   }
