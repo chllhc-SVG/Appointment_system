@@ -460,11 +460,18 @@ export async function createAppointment(input: CreateAppointmentInput) {
 export async function getMyAppointments(input: QueryAppointmentsInput) {
   const customerId = resolveCustomerId(input);
   assertCustomerIdentity(customerId);
-  return listAppointmentsByCustomer(customerId!, input.from_date, input.to_date, input.status, input.service_name, input.keyword);
+  // 「姓名+手机号」成对时按人取并集（覆盖建档前的 guest 单）；不成对则维持 id 作用域。
+  // 手机号相同不再等于同一人：姓名必须同时匹配。
+  const person = input.customer_name?.trim() && input.customer_phone?.trim()
+    ? { name: input.customer_name.trim(), phone: input.customer_phone.trim() }
+    : undefined;
+  return listAppointmentsByCustomer(customerId!, input.from_date, input.to_date, input.status, input.service_name, input.keyword, person);
 }
 
 export async function listAppointments(input: {
   customer_id?: string;
+  customer_name?: string;
+  customer_phone?: string;
   store_id?: string;
   staff_id?: string;
   service_id?: string;
@@ -496,11 +503,15 @@ export async function confirmAppointment(input: { appointment_id: string; operat
   return { success: true, appointment: next };
 }
 
-export async function getAppointmentByCustomer(input: { customer_id?: string; appointment_id?: string; appointment_code?: string }) {
+export async function getAppointmentByCustomer(input: { customer_id?: string; customer_name?: string; customer_phone?: string; appointment_id?: string; appointment_code?: string }) {
   const customerId = resolveCustomerId(input as QueryAppointmentsInput);
   assertCustomerIdentity(customerId);
   if (!input.appointment_id && !input.appointment_code) throw new Error('appointment_id or appointment_code is required');
-  return getAppointmentDetailByCustomer(customerId!, input.appointment_id, input.appointment_code);
+  // 「姓名+手机号」成对时允许命中本人 guest 单（建档前历史预约），仍要求姓名一致
+  const person = input.customer_name?.trim() && input.customer_phone?.trim()
+    ? { name: input.customer_name.trim(), phone: input.customer_phone.trim() }
+    : undefined;
+  return getAppointmentDetailByCustomer(customerId!, input.appointment_id, input.appointment_code, person);
 }
 
 export async function listBookingReferenceData(input: { active_only?: boolean; keyword?: string; limit?: number; store_id?: string; service_id?: string }) {

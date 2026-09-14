@@ -205,6 +205,10 @@ export interface CancelAppointmentInput {
 
 export interface QueryAppointmentsInput {
   customer_id?: string;
+  /** 顾客称呼（与 customer_phone 成对使用时按「人」取并集，覆盖建档前 guest 单） */
+  customer_name?: string;
+  /** 顾客手机号（成对校验用；单独传入不作为定人依据） */
+  customer_phone?: string;
   from_date?: string;
   to_date?: string;
   status?: AppointmentStatus;

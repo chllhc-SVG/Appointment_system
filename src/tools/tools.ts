@@ -26,6 +26,7 @@ import {
   phoneHash,
 } from '../services/customer-identity.js';
 import { pool } from '../db/pool.js';
+import { findStoreByNameFlexible } from '../queries.js';
 
 /**
  * 预约系统对外 MCP 工具（数字人可见面，精简集 5 工具）。
@@ -62,7 +63,7 @@ export const querySlotsInput = z.object({
   store_name: z.string().min(1).optional().describe('门店名，如"上海徐汇门店"；用户直接说门店名时传入，服务端模糊解析为门店'),
   date: z.string().optional().describe('日期：YYYY-MM-DD；也可直接传口语"今天/明天/后天/大后天/周X/9月9日"，服务端自动换算，无需自行推算今天几号'),
   preferred_staff_id: z.string().min(1).optional(),
-  preferred_staff_name: z.string().min(1).optional().describe('员工名，如"李美容师"；用户指定服务员工时传入'),
+  preferred_staff_name: z.string().min(1).optional().describe('员工名，如"李美容师"；用户指定服务员工时传入。【重要】只有用户明确指定技师/美容师人名时才填；门店名（如"上海徐汇门店"）严禁填入此字段，必须填 store_name，否则会被拒绝后无限重试'),
 }).describe('查询指定服务在某天可预约的时段，返回可用员工与时间槽。完整校验链路：门店存在→门店开通该项目→门店有会做该项目的员工→员工当天有排班且时段未占用。【播报铁律】向用户播报时段一律使用 start_local/end_local（东八区本地时间，如"2026-09-09 10:00"就是上午十点），严禁自行换算或朗读 start_at/end_at（那是 UTC，朗读会把上午十点说成凌晨两点）。数字人把"我想预约某个项目"先转成可用时段时调用，随后用 manage_booking(action=create) 创建');
 
 // ===== 预约查询 =====
@@ -93,9 +94,9 @@ export const manageBookingInput = z.object({
   service_id: z.string().min(1).optional(),
   service_name: z.string().min(1).optional().describe('项目名，如"小气泡"。数字人从用户话术中提取后传入，服务端自动解析'),
   store_id: z.string().min(1).optional(),
-  store_name: z.string().min(1).optional().describe('门店名，如"上海徐汇门店"。【必须】用户回答的门店名填在这里，绝不填进 note；只填纯门店名，不带"用户确认"等转述前缀，服务端支持模糊匹配（"徐汇店"也可）。用户没说门店且系统有多家门店时先追问，单店场景可不传'),
+  store_name: z.string().min(1).optional().describe('门店名，如"上海徐汇门店"。【必须】用户回答的门店名填在这里，绝不填进 note 或 staff_name；只填纯门店名，不带"用户确认"等转述前缀，服务端支持模糊匹配（"徐汇店"也可）。用户没说门店且系统有多家门店时先追问，单店场景可不传'),
   staff_id: z.string().min(1).optional(),
-  staff_name: z.string().min(1).optional().describe('员工名，如"李美容师"；用户指定员工时传入，服务端在门店内按名字解析'),
+  staff_name: z.string().min(1).optional().describe('员工名，如"李美容师"；用户指定员工时传入，服务端在门店内按名字解析。【重要】门店名（如"上海徐汇门店"）严禁填入此字段，必须填 store_name；不确定指定人选时留空不填'),
   start_at: z.string().min(1).optional().describe('到店时间：必须是 query_slots 返回的某个时段的 start_at 原文（UTC ISO），或"YYYY-MM-DD HH:mm"（东八区本地时间）。严禁把用户说的本地时间换算后再传。从 query_slots 结果中获取'),
   appointment_id: z.string().min(1).optional(),
   appointment_code: z.string().min(1).optional().describe('预约码，优先用于精确定位预约'),
@@ -178,6 +179,39 @@ const storeCatalogHandler = async (input: unknown) => {
   }
 };
 
+/** 门店名错放回收（query_slots / manage_booking 入口共用）。
+ *
+ * 线上死循环根因：用户说“我去上海徐汇门店做光子嫩肤”，LLM 却把门店名填进
+ * preferred_staff_name（员工名字段），store_name 留空 → 服务端按“未指定门店 +
+ * 多店”返回 NEEDS_MORE_INFO（请确认门店）→ LLM 认为用户早说过了，原参数重试 →
+ * 同一错误无限循环（日志：14:37:05~14:37:53 连续 8 次 NEEDS_MORE_INFO）。
+ *
+ * 回收规则（只在正字段缺失时介入，显式传参一律不动）：
+ *  1) store_id/store_name 均为空，且员工名/项目名字段里有值；
+ *  2) 该值能命中一家在营门店（findStoreByNameFlexible 精确/包含/去后缀匹配）；
+ *  3) 该值同时不是任何在职员工名（防“门店恰好和某技师同名”误伤指定技师场景）。
+ * 满足三条才把值搬进 store_name 并清空错放字段。 */
+async function recoverMisplacedStoreName(input: unknown): Promise<void> {
+  if (!isRecord(input)) return;
+  const textOf = (key: string) => (typeof input[key] === 'string' ? String(input[key]).trim() : '');
+  if (textOf('store_id') || textOf('store_name')) return;
+  for (const key of ['preferred_staff_name', 'staff_name'] as const) {
+    const candidate = textOf(key);
+    if (!candidate) continue;
+    const store = await findStoreByNameFlexible(candidate);
+    if (!store) continue;
+    // 该值若是真实在职员工名，按员工语义保留，不做搬迁
+    const { rows } = await pool.query(
+      'SELECT 1 FROM staff WHERE is_active = true AND (name = $1 OR $1 LIKE \'%\' || name || \'%\') LIMIT 1',
+      [candidate],
+    );
+    if (rows.length > 0) continue;
+    input.store_name = store.name;
+    delete input[key];
+    return;
+  }
+}
+
 const querySlotsHandler = async (input: unknown) => {
   const requiredDate = requireFields(input, ['date'], '请先告诉我您想预约哪一天。');
   if (requiredDate) return requiredDate;
@@ -185,6 +219,8 @@ const querySlotsHandler = async (input: unknown) => {
   if (!record.service_id && !record.service_name) {
     return missing(['service_id|service_name'], '请先告诉我您要预约哪个项目。');
   }
+  // 门店名可能被 LLM 错放进员工/项目字段：先回收再查档期，否则多店场景会无限 NEEDS_MORE_INFO
+  await recoverMisplacedStoreName(input);
   return searchAvailableSlots(only(input, ['service_id', 'service_name', 'store_id', 'store_name', 'date', 'preferred_staff_id', 'preferred_staff_name']) as unknown as Parameters<typeof searchAvailableSlots>[0]);
 };
 
@@ -216,11 +252,17 @@ function decorateAppointmentsForSpeech(result: unknown): unknown {
   return result;
 }
 
-/** 预约查询双重校验：手机号+姓名必须成对且一致，防同号/同名串号；未传则沿用会话绑定，不改原链路 */
+/** 预约查询双重校验：手机号+姓名必须成对且一致，防同号/同名串号；未传则沿用会话绑定，不改原链路。
+ *
+ * 关键行为（线上 3 条串号修正）：
+ *  - 单传 phone_hash 等价（同手机号不同档案 → IDENTITY_MISMATCH，要求同时提供姓名）：
+ *    绝不以单一手机号直接定位顾客档案。手机号只是“索引键”，定人必须姓名一致。
+ *  - 手机号+姓名成对命中唯一档案后，后续查询强制按该档案 id 作用域，杜绝 LLM 传错
+ *    customer_id 串号；与会话绑定 customer_id 不一致时直接拒绝，不静默覆盖。 */
 async function verifyBookingQueryIdentity(
   input: unknown,
   boundCustomerId?: string,
-): Promise<{ ok: true; verifiedCustomerId?: string } | { ok: false; error: Record<string, unknown> }> {
+): Promise<{ ok: true; effectiveCustomerId?: string } | { ok: false; error: Record<string, unknown> }> {
   const record = isRecord(input) ? input : {};
   const rawPhone = typeof record.customer_phone === 'string' ? record.customer_phone.trim() : '';
   const rawName = typeof record.customer_name === 'string' ? record.customer_name.trim() : '';
@@ -277,7 +319,7 @@ async function verifyBookingQueryIdentity(
     }
     // 双重校验通过：后续查询强制按该档案 id 作用域，避免 LLM 传错 customer_id 串号
     (record as Record<string, unknown>).customer_id = profile.customer_id;
-    return { ok: true, verifiedCustomerId: profile.customer_id };
+    return { ok: true, effectiveCustomerId: profile.customer_id };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (msg.includes('IDENTIFY_INVALID_PHONE')) {
@@ -288,33 +330,50 @@ async function verifyBookingQueryIdentity(
 }
 
 const queryBookingsHandler = async (input: unknown) => {
-  const scope = scopeOf(input);
+  // scope 缺省即 my：顾客问“我的预约”时 LLM 常漏传 scope，原实现落 default 返回
+  // INVALID_ARGUMENT，数字人拿到错误码后既不出声也不追问，表现为“直接不理人、
+  // 无思考中、日志无记录”。现在缺省按 my 走会话身份查询，链路其余部分零改动。
+  const rawScope = scopeOf(input);
+  const scope = rawScope || 'my';
+  if (isRecord(input)) (input as Record<string, unknown>).scope = scope;
   const boundId = isRecord(input) && typeof input.customer_id === 'string' ? String(input.customer_id).trim() || undefined : undefined;
 
-  // 需要顾客作用域的 scope 先做手机号+姓名双重校验（单字段不单独定人）
+  // 需要顾客作用域的 scope 先做手机号+姓名双重校验（单字段不单独定人）。
+  // 校验通过后统一用「档案 id + 已验证的姓名/手机号对」双重作用域：id 命中档案单，
+  // 姓名对命中建档前的 guest 单；手机号相同但姓名不同的单子（家人共用号）绝不合并。
+  let effectiveCustomerId = boundId;
   if (['my', 'detail', 'audits', 'list'].includes(scope)) {
     const verified = await verifyBookingQueryIdentity(input, boundId);
     if (!verified.ok) return verified.error;
+    if (verified.ok) effectiveCustomerId = verified.effectiveCustomerId ?? boundId;
+  }
+  // 校验通过后统一用 effectiveCustomerId 覆盖 LLM 传的 customer_id（防串号），
+  // 显式双重校验已在函数内写回 record.customer_id；会话绑定场景在这里写回。
+  if (isRecord(input) && effectiveCustomerId) {
+    (input as Record<string, unknown>).customer_id = effectiveCustomerId;
   }
 
   switch (scope) {
     case 'my':
-      return decorateAppointmentsForSpeech(await getMyAppointments(only(input, ['customer_id', 'from_date', 'to_date', 'status', 'service_name', 'keyword']) as unknown as Parameters<typeof getMyAppointments>[0]));
+      return decorateAppointmentsForSpeech(await getMyAppointments(only(input, ['customer_id', 'customer_name', 'customer_phone', 'from_date', 'to_date', 'status', 'service_name', 'keyword']) as unknown as Parameters<typeof getMyAppointments>[0]));
     case 'detail': {
       const record = isRecord(input) ? input : {};
       if (!record.appointment_id && !record.appointment_code) {
         return missing(['appointment_id|appointment_code'], '请先告诉我预约码，或者直接告诉我是哪一单预约。');
       }
-      return decorateAppointmentsForSpeech(await getAppointmentByIdentifier(only(input, ['customer_id', 'appointment_id', 'appointment_code']) as unknown as Parameters<typeof getAppointmentByIdentifier>[0]));
+      return decorateAppointmentsForSpeech(await getAppointmentByIdentifier(only(input, ['customer_id', 'customer_name', 'customer_phone', 'appointment_id', 'appointment_code']) as unknown as Parameters<typeof getAppointmentByIdentifier>[0]));
     }
-    case 'list':
-      return decorateAppointmentsForSpeech(await listAppointments(only(input, ['customer_id', 'store_id', 'staff_id', 'service_id', 'service_name', 'from_date', 'to_date', 'status', 'keyword', 'limit', 'offset']) as unknown as Parameters<typeof listAppointments>[0]));
+    case 'list': {
+      // 共享终端（有会话绑定或双重校验）时强制按人过滤；管理后台 REST（无 customer_id）保持原全量行为。
+      const listInput = only(input, ['customer_id', 'customer_name', 'customer_phone', 'store_id', 'staff_id', 'service_id', 'service_name', 'from_date', 'to_date', 'status', 'keyword', 'limit', 'offset']) as unknown as Parameters<typeof listAppointments>[0];
+      return decorateAppointmentsForSpeech(await listAppointments(listInput));
+    }
     case 'audits': {
       const record = isRecord(input) ? input : {};
       if (!record.appointment_id && !record.appointment_code) {
         return missing(['appointment_id|appointment_code'], '请先告诉我预约码，我再帮您查这单预约的流转记录。');
       }
-      return listAppointmentAudits(only(input, ['customer_id', 'appointment_id', 'appointment_code']) as unknown as Parameters<typeof listAppointmentAudits>[0]);
+      return listAppointmentAudits(only(input, ['customer_id', 'customer_name', 'customer_phone', 'appointment_id', 'appointment_code']) as unknown as Parameters<typeof listAppointmentAudits>[0]);
     }
     case 'overview':
       return getAppointmentOverview(only(input, ['from_date', 'to_date', 'store_id']) as unknown as Parameters<typeof getAppointmentOverview>[0]);
@@ -434,7 +493,11 @@ const manageBookingHandler = async (input: unknown) => {
   // 以 NEEDS_MORE_INFO 拒绝（0ms，用户感知为"一直报错"）。这里在入口把可辨认
   // 的值从 note 搬回正字段，仅当正字段缺失且 note 文本可提取时生效，不改写
   // 用户显式传过的字段。无法识别的内容留在 note 原样透传。
-  if (action === 'create') recoverFieldsFromNote(input);
+  if (action === 'create') {
+    recoverFieldsFromNote(input);
+    // 与 query_slots 同一错放回收：门店名可能被塞进员工名（已回收 note，仍有直接错位的 case）
+    await recoverMisplacedStoreName(input);
+  }
   const speak = async (result: unknown) => {
     const record = result as Record<string, unknown> | null;
     if (!record || record.success !== true) return result;

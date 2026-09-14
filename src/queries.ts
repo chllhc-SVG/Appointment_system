@@ -194,13 +194,55 @@ export async function getAppointmentByCode(code: string) {
   return rows[0] ? mapAppointment(rows[0]) : undefined;
 }
 
-export async function getAppointmentDetailByCustomer(customerId: string, appointmentId?: string, appointmentCode?: string) {
+/** 顾客「人」作用域：姓名+手机号成对（双重校验通过后使用）。
+ *  同一真人建档前以 guest customer_id 落的历史单，姓名+手机号一致 → 应能查到；
+ *  仅手机号相同但姓名不同（家人共用号码）→ 不算同一人，必须排除。 */
+export type PersonScope = { name: string; phone: string };
+
+/** 手机号存储形态兼容：预约单可能落原文（LLM 传）也可能落掩码（档案补齐），两种都算同号 */
+const phoneVariants = (phone: string): string[] => {
+  const raw = phone.trim();
+  const digits = raw.replace(/\D/g, '');
+  const masked = digits.length >= 7 ? `${digits.slice(0, 3)}****${digits.slice(-4)}` : raw;
+  return [...new Set([raw, masked].filter(Boolean))];
+};
+
+/** SQL 片段：a 表上「姓名+手机号」成对命中（两向包含兼容"王女士/王小姐"称呼差异） */
+const pushPersonPairCondition = (params: unknown[], person: PersonScope): string => {
+  params.push(person.name.trim());
+  const nameIdx = params.length;
+  params.push(phoneVariants(person.phone));
+  const phoneIdx = params.length;
+  return `(
+    btrim(COALESCE(a.customer_name, '')) <> ''
+    AND a.customer_phone = ANY($${phoneIdx}::text[])
+    AND (
+      lower(btrim(a.customer_name)) = lower($${nameIdx})
+      OR lower(btrim(a.customer_name)) LIKE '%' || lower($${nameIdx}) || '%'
+      OR lower($${nameIdx}) LIKE '%' || lower(btrim(a.customer_name)) || '%'
+    )
+  )`;
+};
+
+/** 行级等价判定（详情/审计在内存里比对单条记录时用） */
+export const appointmentMatchesPerson = (appointment: { customer_name?: string | null; customer_phone?: string | null }, person?: PersonScope) => {
+  if (!person?.name?.trim() || !person?.phone?.trim()) return false;
+  const name = String(appointment.customer_name ?? '').trim();
+  const phone = String(appointment.customer_phone ?? '').trim();
+  if (!name || !phone) return false;
+  const nameOk = name === person.name || name.includes(person.name) || person.name.includes(name);
+  return nameOk && phoneVariants(person.phone).includes(phone);
+};
+
+export async function getAppointmentDetailByCustomer(customerId: string, appointmentId?: string, appointmentCode?: string, person?: PersonScope) {
   const appointment = appointmentId
     ? await getAppointment(appointmentId)
     : appointmentCode
       ? await getAppointmentByCode(appointmentCode)
       : undefined;
-  if (!appointment || appointment.customer_id !== customerId) return undefined;
+  if (!appointment) return undefined;
+  // 归属：档案 id 命中，或「姓名+手机号」成对命中（建档前的 guest 单同属本人）
+  if (appointment.customer_id !== customerId && !appointmentMatchesPerson(appointment, person)) return undefined;
   const [store, staff, service, audits] = await Promise.all([
     getStore(appointment.store_id),
     getStaff(appointment.staff_id),
@@ -217,9 +259,15 @@ export async function listAppointmentsByCustomer(
   status?: AppointmentStatus,
   serviceName?: string,
   keyword?: string,
+  person?: PersonScope,
 ) {
-  const conditions: string[] = ['a.customer_id = $1'];
   const params: unknown[] = [customerId];
+  // 作用域：默认按 customer_id；带已校验的「姓名+手机号」对时，并集命中同姓名同手机号
+  // 但 customer_id 不同的历史 guest 单。手机号相同不再等于同一人——姓名必须同时匹配。
+  const scope = person?.name && person?.phone
+    ? `(a.customer_id = $1 OR ${pushPersonPairCondition(params, person)})`
+    : 'a.customer_id = $1';
+  const conditions: string[] = [scope];
   if (fromDate) { params.push(fromDate); conditions.push(`a.start_at >= $${params.length}`); }
   if (toDate) { params.push(toDate); conditions.push(`a.start_at <= $${params.length}`); }
   if (status) { params.push(status); conditions.push(`a.status = $${params.length}`); }
@@ -255,6 +303,9 @@ export async function listAppointmentsByCustomer(
 }
 
 export async function listAppointmentsByFilters(input: {
+  customer_id?: string;
+  customer_name?: string;
+  customer_phone?: string;
   store_id?: string;
   staff_id?: string;
   service_id?: string;
@@ -268,6 +319,13 @@ export async function listAppointmentsByFilters(input: {
 }) {
   const params: unknown[] = [];
   const conditions: string[] = ['1=1'];
+  // 共享终端「查我的预约」被 LLM 路由到 list 时，必须按人过滤，否则退化成全量列表
+  // （线上问题：骨架识别会话查出 3 条，含同手机号下别的档案 2 条）。
+  // 管理后台 REST 不传这些字段，行为保持原样（全量 + keyword 搜索）。
+  if (input.customer_id?.trim()) { params.push(input.customer_id.trim()); conditions.push(`a.customer_id = $${params.length}`); }
+  if (input.customer_name?.trim() && input.customer_phone?.trim()) {
+    conditions.push(pushPersonPairCondition(params, { name: input.customer_name, phone: input.customer_phone }));
+  }
   if (input.store_id?.trim()) { params.push(input.store_id.trim()); conditions.push(`a.store_id = $${params.length}`); }
   if (input.staff_id?.trim()) { params.push(input.staff_id.trim()); conditions.push(`a.staff_id = $${params.length}`); }
   if (input.service_id?.trim()) { params.push(input.service_id.trim()); conditions.push(`a.service_id = $${params.length}`); }
