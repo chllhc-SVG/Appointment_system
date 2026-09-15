@@ -9,6 +9,7 @@
     "start": "node dist/main.js",
     "build": "tsup src/main.ts --format esm --dts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
     "migrate": "tsx src/scripts/migrate.ts",
     "seed": "tsx src/scripts/seed.ts",
     "docker:dev": "docker compose up --build",
@@ -35,6 +36,7 @@
     "@types/pg": "^8.23.1",
     "tsup": "^8.5.0",
     "tsx": "^4.20.3",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^5.0.1"
   }
 }

@@ -133,7 +133,7 @@ const only = <T extends Record<string, unknown>>(input: unknown, keys: string[])
   return Object.fromEntries(keys.filter((key) => record[key] !== undefined).map((key) => [key, record[key]])) as T;
 };
 
-const missing = (fields: string[], suggestedQuestion: string) => ({
+export const missing = (fields: string[], suggestedQuestion: string) => ({
   success: false,
   error_code: 'NEEDS_MORE_INFO',
   message: '参数不完整，请先向用户追问缺失信息后再调用。',
@@ -148,7 +148,7 @@ const missing = (fields: string[], suggestedQuestion: string) => ({
     .join('；'),
 });
 
-const requireFields = (input: unknown, fields: string[], suggestedQuestion: string) => {
+export const requireFields = (input: unknown, fields: string[], suggestedQuestion: string) => {
   const record = isRecord(input) ? input : {};
   // 复合字段（service_id|service_name）：任一存在即视为已提供
   const missingFields = fields.filter((field) => {
@@ -234,15 +234,15 @@ const querySlotsHandler = async (input: unknown) => {
  * TTS 把十六进制逐字符读成"零么幺幺…"并刷屏。预约码只用于门店后台核对，
  * 顾客到店凭手机号核实即可，因此这里把 appointment_code / booking_code 从
  * 数字人可见的返回中彻底剥离（管理后台 REST 接口不受影响，仍能看到全码）。 */
-const CODE_FIELDS = ['appointment_code', 'booking_code'] as const;
+export const CODE_FIELDS = ['appointment_code', 'booking_code'] as const;
 
-const stripCodes = <T extends Record<string, unknown>>(record: T): T => {
+export const stripCodes = <T extends Record<string, unknown>>(record: T): T => {
   const next: Record<string, unknown> = { ...record };
   for (const field of CODE_FIELDS) delete next[field];
   return next as T;
 };
 
-function decorateAppointmentsForSpeech(result: unknown): unknown {
+export function decorateAppointmentsForSpeech(result: unknown): unknown {
   const decorateAppointment = (appointment: Record<string, unknown> | undefined | null) => {
     if (!appointment || typeof appointment !== 'object') return appointment;
     return stripCodes({
@@ -398,7 +398,7 @@ const queryBookingsHandler = async (input: unknown) => {
 };
 
 /** 剥离 note 里的对话噪音前缀（"用户确认/那就选/说去"等），与 queries.ts 保持一致 */
-const stripNotePrefix = (value: string): string => {
+export const stripNotePrefix = (value: string): string => {
   let text = value.trim();
   for (let i = 0; i < 4; i += 1) {
     const next = text
@@ -424,7 +424,7 @@ const stripNotePrefix = (value: string): string => {
  * 现改为：先剥噪音前缀，再取"含门店/店后缀的最后一段短语"（2-8字），
  * 避免前缀污染；员工/项目回收同理仅在缺失时介入。
  */
-const recoverFieldsFromNote = (input: unknown): void => {
+export const recoverFieldsFromNote = (input: unknown): void => {
   if (!isRecord(input)) return;
   const note = typeof input.note === 'string' ? input.note.trim() : '';
   if (!note) return;

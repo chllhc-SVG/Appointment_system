@@ -33,7 +33,7 @@ const toPagination = (limit?: number) => Math.max(1, Math.min(Number(limit ?? 20
  * 写操作（catalog 增改停用、kb-sync 同步）统一调 invalidateReferenceCaches()，
  * 版本守卫防止"查询进行中发生了失效"导致旧结果写回。
  */
-const REF_CACHE_TTL_MS = 45_000;
+export const REF_CACHE_TTL_MS = 45_000;
 let refCacheVersion = 0;
 
 interface RefCacheEntry<T> { value: T; expiresAt: number; version: number }
@@ -57,7 +57,7 @@ async function cachedQuery<T>(key: string, run: () => Promise<T>): Promise<T> {
 }
 
 /** 在营门店全量（含 service_ids），门店名匹配与单店兜底共用一份缓存。 */
-async function fetchActiveStores(): Promise<Store[]> {
+export async function fetchActiveStores(): Promise<Store[]> {
   return cachedQuery('stores:active', async () => {
     const { rows } = await pool.query(
       `SELECT
@@ -74,7 +74,7 @@ async function fetchActiveStores(): Promise<Store[]> {
   });
 }
 
-const ilikeLike = (pattern: string, value: string) => {
+export const ilikeLike = (pattern: string, value: string) => {
   // pattern 形如 "%武汉%"：转小写包含判断（与 ILIKE %kw% 等价语义），缓存路径内存过滤用
   const kw = pattern.replace(/^%|%$/g, '').toLowerCase();
   return value.toLowerCase().includes(kw);
