@@ -378,21 +378,3 @@ docker exec -it appointment-mcp-postgres psql -U postgres -d appointment_mcp
 | 启动连接预热 | `db/pool.ts` `warmupPool` | 冷启动首笔调用不付建连开销 |
 
 实测（同参数直连库复测）：`query_slots` 冷 142ms → 热 5~9ms；线上日志热态普遍 5~60ms。
-
-### 实测方法（可复现）
-
-写一个临时脚本按阶段计时（门店→项目→技能→排班bulk→占用bulk），先跑一次（冷），再连跑两次（热），对比。结束后删除脚本。诊断耗时问题时建议照此法先拆阶段再下结论，不要猜。
-
-### 已知边界与待办
-
-- **冷启动税**：服务重启后第一次 `query_slots` 约 150~270ms（建连+建缓存）。可做：`main.ts` 里 `warmupPool()` 后预热一次 `fetchActiveStores()`（需先在 `queries.ts` export），把 156ms 挪进启动日志。5 分钟工作量，未做。
-- **30 分钟服务缓冲未做**：当前允许背靠背预约（上一位 10:00 结束，下一位 10:00 可约）。若业务要求"结束后留 30 分钟"，需改 4 处：`computeAvailableSlots` 占用区间两侧扩 buffer、建单/改期前复查、排他约束改 `tstzrange(start-30m, end+30m)`、错误仍复用 `TIME_CONFLICT`。动工前先与业务确认规则。
-- **任意分钟预约（如 9:23）未做**：当前槽位从排班整点按 `max(时长,30min)` 步长生成。若要做，候选起点需并入"每个已约单 end+buffer"，风险可控但需重新验证状态机，建议单独立项。
-
----
-
-## 附：git 提交与协作约定
-
-- 一个 commit 讲一件事（耗时优化/去码/前端列，分开提），方便回滚与追溯。
-- 提交前本地过三关：`pnpm typecheck`、`pnpm build`、`pnpm --dir web build`。
-- 迁移文件一旦合并进主干并在线上跑过，**只增不改**（新变更写 010、011…）。
