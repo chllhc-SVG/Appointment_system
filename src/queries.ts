@@ -27,7 +27,71 @@ const mapAudit = (row: Record<string, unknown>): AppointmentAudit => row as unkn
 
 const toPagination = (limit?: number) => Math.max(1, Math.min(Number(limit ?? 20), 100));
 
+/**
+ * 进程内 TTL 缓存：只缓存"几乎不变"的基础资料（门店、项目名解析、员工技能），
+ * 绝不缓存排班/占用/预约（那些每次必须查库，否则会双约）。
+ * 写操作（catalog 增改停用、kb-sync 同步）统一调 invalidateReferenceCaches()，
+ * 版本守卫防止"查询进行中发生了失效"导致旧结果写回。
+ */
+const REF_CACHE_TTL_MS = 45_000;
+let refCacheVersion = 0;
+
+interface RefCacheEntry<T> { value: T; expiresAt: number; version: number }
+const refCache = new Map<string, RefCacheEntry<unknown>>();
+
+/** 清空全部基础资料缓存（门店/项目/员工技能共用），写操作后调用。 */
+export function invalidateReferenceCaches() {
+  refCacheVersion += 1;
+  refCache.clear();
+}
+
+async function cachedQuery<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const hit = refCache.get(key) as RefCacheEntry<T> | undefined;
+  if (hit && hit.version === refCacheVersion && hit.expiresAt > Date.now()) return hit.value;
+  const versionAtStart = refCacheVersion;
+  const value = await run();
+  if (versionAtStart === refCacheVersion) {
+    refCache.set(key, { value, expiresAt: Date.now() + REF_CACHE_TTL_MS, version: refCacheVersion });
+  }
+  return value;
+}
+
+/** 在营门店全量（含 service_ids），门店名匹配与单店兜底共用一份缓存。 */
+async function fetchActiveStores(): Promise<Store[]> {
+  return cachedQuery('stores:active', async () => {
+    const { rows } = await pool.query(
+      `SELECT
+         st.*,
+         COALESCE(array_agg(ss.service_id) FILTER (WHERE ss.service_id IS NOT NULL), '{}') AS service_ids
+       FROM stores st
+       LEFT JOIN store_services ss ON ss.store_id = st.id
+       WHERE st.is_active = true
+       GROUP BY st.id
+       ORDER BY st.name ASC, st.id ASC
+       LIMIT 100`,
+    );
+    return rows.map(mapStore);
+  });
+}
+
+const ilikeLike = (pattern: string, value: string) => {
+  // pattern 形如 "%武汉%"：转小写包含判断（与 ILIKE %kw% 等价语义），缓存路径内存过滤用
+  const kw = pattern.replace(/^%|%$/g, '').toLowerCase();
+  return value.toLowerCase().includes(kw);
+};
+
 export async function listStores(activeOnly = true, keyword?: string, limit = 20) {
+  // 在营门店走缓存（数字人热路径）；带关键字时内存过滤同一份缓存（ILIKE %kw% 等价），
+  // 其余组合保持原 SQL，行为不变。返回浅拷贝（service_ids 复制），防缓存被原地污染。
+  if (activeOnly) {
+    const all = await fetchActiveStores();
+    const filtered = keyword?.trim()
+      ? all.filter((s) => ilikeLike(`%${keyword.trim()}%`, s.name) || ilikeLike(`%${keyword.trim()}%`, s.timezone))
+      : all;
+    return filtered
+      .slice(0, toPagination(limit))
+      .map((s) => ({ ...s, service_ids: s.service_ids ? [...s.service_ids] : s.service_ids }));
+  }
   const params: unknown[] = [];
   const conditions: string[] = [];
   if (activeOnly) conditions.push(`st.is_active = true`);
@@ -51,7 +115,10 @@ export async function listStores(activeOnly = true, keyword?: string, limit = 20
   return rows.map(mapStore);
 }
 
+/** 在营且 id 已知的门店单查：先查缓存命中，未命中（停用/新增 45s 内）再走库兜底。 */
 export async function getStore(id: string) {
+  const cached = (await fetchActiveStores()).find((s) => s.id === id);
+  if (cached) return { ...cached, service_ids: cached.service_ids ? [...cached.service_ids] : cached.service_ids };
   const { rows } = await pool.query(
     `SELECT
        st.*,
@@ -112,37 +179,43 @@ export async function listServices(storeId?: string, keyword?: string, activeOnl
 }
 
 export async function getService(id: string) {
-  const { rows } = await pool.query('SELECT * FROM services WHERE id = $1 AND is_active = true LIMIT 1', [id]);
-  return rows[0] ? mapService(rows[0]) : undefined;
+  return cachedQuery(`service:id:${id}`, async () => {
+    const { rows } = await pool.query('SELECT * FROM services WHERE id = $1 AND is_active = true LIMIT 1', [id]);
+    return rows[0] ? mapService(rows[0]) : undefined;
+  });
 }
 
 /** 按名称模糊匹配服务（数字人直接说"皮肤管理"即可解析），匹配多个时返回第一个。
  *  传入 storeId 时限定该店可做范围（store_services，旧数据无勾选时回退"店内在职员工可做项目"），
- *  避免数字人约到该店未开通的项目。 */
+ *  避免数字人约到该店未开通的项目。
+ *  名称+门店的组合键缓存：项目几天才变一次，数字人每次 query_slots 都要解析一次。 */
 export async function findServiceByName(name: string, storeId?: string) {
-  const params: unknown[] = [];
-  const conditions: string[] = [`s.is_active = true`];
-  if (storeId?.trim()) {
-    params.push(storeId.trim());
-    conditions.push(`(
-      CASE WHEN EXISTS (SELECT 1 FROM store_services ss2 WHERE ss2.store_id = $${params.length})
-        THEN EXISTS (SELECT 1 FROM store_services ss3 WHERE ss3.store_id = $${params.length} AND ss3.service_id = s.id)
-        ELSE EXISTS (
-          SELECT 1 FROM staff_service_skills sk
-          JOIN staff st ON st.id = sk.staff_id
-          WHERE sk.service_id = s.id AND st.store_id = $${params.length} AND st.is_active = true
-        )
-      END
-    )`);
-  }
-  params.push(`%${name.trim()}%`);
-  const { rows } = await pool.query(
-    `SELECT * FROM services s
-     WHERE ${conditions.join(' AND ')} AND s.name ILIKE $${params.length}
-     ORDER BY s.name ASC LIMIT 1`,
-    params,
-  );
-  return rows[0] ? mapService(rows[0]) : undefined;
+  const cacheKey = `service:name:${name.trim().toLowerCase()}|store:${storeId?.trim() ?? ''}`;
+  return cachedQuery(cacheKey, async () => {
+    const params: unknown[] = [];
+    const conditions: string[] = [`s.is_active = true`];
+    if (storeId?.trim()) {
+      params.push(storeId.trim());
+      conditions.push(`(
+        CASE WHEN EXISTS (SELECT 1 FROM store_services ss2 WHERE ss2.store_id = $${params.length})
+          THEN EXISTS (SELECT 1 FROM store_services ss3 WHERE ss3.store_id = $${params.length} AND ss3.service_id = s.id)
+          ELSE EXISTS (
+            SELECT 1 FROM staff_service_skills sk
+            JOIN staff st ON st.id = sk.staff_id
+            WHERE sk.service_id = s.id AND st.store_id = $${params.length} AND st.is_active = true
+          )
+        END
+      )`);
+    }
+    params.push(`%${name.trim()}%`);
+    const { rows } = await pool.query(
+      `SELECT * FROM services s
+       WHERE ${conditions.join(' AND ')} AND s.name ILIKE $${params.length}
+       ORDER BY s.name ASC LIMIT 1`,
+      params,
+    );
+    return rows[0] ? mapService(rows[0]) : undefined;
+  });
 }
 
 export async function listStaff(storeId?: string, serviceId?: string, keyword?: string, activeOnly = true, limit = 20): Promise<StaffWithSkills[]> {
@@ -180,8 +253,10 @@ export async function listStaff(storeId?: string, serviceId?: string, keyword?: 
 }
 
 export async function getStaff(id: string) {
-  const { rows } = await pool.query('SELECT * FROM staff WHERE id = $1 AND is_active = true LIMIT 1', [id]);
-  return rows[0] ? mapStaff(rows[0]) : undefined;
+  return cachedQuery(`staff:id:${id}`, async () => {
+    const { rows } = await pool.query('SELECT * FROM staff WHERE id = $1 AND is_active = true LIMIT 1', [id]);
+    return rows[0] ? mapStaff(rows[0]) : undefined;
+  });
 }
 
 export async function getAppointment(id: string) {
@@ -261,40 +336,87 @@ export async function listAppointmentsByCustomer(
   keyword?: string,
   person?: PersonScope,
 ) {
-  const params: unknown[] = [customerId];
-  // 作用域：默认按 customer_id；带已校验的「姓名+手机号」对时，并集命中同姓名同手机号
-  // 但 customer_id 不同的历史 guest 单。手机号相同不再等于同一人——姓名必须同时匹配。
-  const scope = person?.name && person?.phone
-    ? `(a.customer_id = $1 OR ${pushPersonPairCondition(params, person)})`
-    : 'a.customer_id = $1';
-  const conditions: string[] = [scope];
-  if (fromDate) { params.push(fromDate); conditions.push(`a.start_at >= $${params.length}`); }
-  if (toDate) { params.push(toDate); conditions.push(`a.start_at <= $${params.length}`); }
-  if (status) { params.push(status); conditions.push(`a.status = $${params.length}`); }
+  // 可选过滤条件（两段 UNION 查询共用同一拼接，保证语义与原单查询一致）
+  const extra = {
+    conditions: [] as string[],
+    params: [] as unknown[],
+  };
+  if (fromDate) { extra.params.push(fromDate); extra.conditions.push(`a.start_at >= $X`); }
+  if (toDate) { extra.params.push(toDate); extra.conditions.push(`a.start_at <= $X`); }
+  if (status) { extra.params.push(status); extra.conditions.push(`a.status = $X`); }
   if (serviceName?.trim()) {
-    params.push(`%${serviceName.trim()}%`);
-    conditions.push(`EXISTS (SELECT 1 FROM services sv WHERE sv.id = a.service_id AND sv.name ILIKE $${params.length})`);
+    extra.params.push(`%${serviceName.trim()}%`);
+    extra.conditions.push(`EXISTS (SELECT 1 FROM services sv WHERE sv.id = a.service_id AND sv.name ILIKE $X)`);
   }
   if (keyword?.trim()) {
-    params.push(`%${keyword.trim()}%`);
-    conditions.push(`(
-      a.appointment_code ILIKE $${params.length}
-      OR EXISTS (SELECT 1 FROM services sv2 WHERE sv2.id = a.service_id AND sv2.name ILIKE $${params.length})
-      OR EXISTS (SELECT 1 FROM staff sf WHERE sf.id = a.staff_id AND sf.name ILIKE $${params.length})
+    extra.params.push(`%${keyword.trim()}%`);
+    extra.conditions.push(`(
+      a.appointment_code ILIKE $X
+      OR EXISTS (SELECT 1 FROM services sv2 WHERE sv2.id = a.service_id AND sv2.name ILIKE $X)
+      OR EXISTS (SELECT 1 FROM staff sf WHERE sf.id = a.staff_id AND sf.name ILIKE $X)
     )`);
   }
-  // 关联服务/员工/门店：数字人对话与日志中心能直接展示项目名、员工名、门店名，而不是只有 id
-  const { rows } = await pool.query(
-    `SELECT a.*, sv.name AS service_name, st.name AS staff_name, st2.name AS store_name
+  const joinSelect = `
+    SELECT a.*, sv.name AS service_name, st.name AS staff_name, st2.name AS store_name
      FROM appointments a
      LEFT JOIN services sv ON sv.id = a.service_id
      LEFT JOIN staff st ON st.id = a.staff_id
-     LEFT JOIN stores st2 ON st2.id = a.store_id
-     WHERE ${conditions.join(' AND ')}
-     ORDER BY a.start_at DESC`,
-    params,
+     LEFT JOIN stores st2 ON st2.id = a.store_id`;
+  const buildSegment = (base: string, baseParams: unknown[], startIndex: number) => {
+    const segments: string[] = [base];
+    let index = startIndex;
+    for (const template of extra.conditions) {
+      // ILIKE 模板里 $X 可能出现多次：同一模板内的占位符复用同一参数编号
+      const placeholders = (template.match(/\$X/g) ?? []).length;
+      let rendered = template;
+      for (let i = 0; i < placeholders; i += 1) rendered = rendered.replace('$X', `$${index}`);
+      segments.push(rendered);
+      index += 1;
+    }
+    return { where: segments.join(' AND '), params: [...baseParams, ...extra.params], nextIndex: index };
+  };
+
+  // 无 person：维持原单查询（customer_id 索引直达），行为与之前逐字一致
+  if (!person?.name || !person?.phone) {
+    const seg = buildSegment(`a.customer_id = $1`, [customerId], 2);
+    const { rows } = await pool.query(
+      `${joinSelect} WHERE ${seg.where} ORDER BY a.start_at DESC`,
+      seg.params,
+    );
+    return rows.map((row) => ({
+      ...mapAppointment(row),
+      service_name: (row.service_name as string) ?? null,
+      staff_name: (row.staff_name as string) ?? null,
+      store_name: (row.store_name as string) ?? null,
+    }));
+  }
+
+  // 有 person：两段 UNION ALL 各走各的索引（customer_id 段 + 姓名电话段），内存按 id 去重后排序。
+  // 等价于原 `(a.customer_id = $1 OR 姓名电话命中)`，只是避免 OR 让 customer_id 索引失效。
+  // 手机号相同不再等于同一人——姓名必须同时匹配（pushPersonPairCondition 内保证）。
+  const segId = buildSegment(`a.customer_id = $1`, [customerId], 2);
+  const personParams: unknown[] = [];
+  const pairCondition = pushPersonPairCondition(personParams, person);
+  const segPerson = buildSegment(pairCondition, personParams, 1);
+  const shiftPlaceholders = (where: string, offset: number) =>
+    where.replace(/\$(\d+)/g, (_, n) => `$${Number(n) + offset}`);
+  const personWhere = shiftPlaceholders(segPerson.where, segId.params.length);
+  const { rows } = await pool.query(
+    `${joinSelect} WHERE ${segId.where}
+     UNION ALL
+     ${joinSelect} WHERE ${personWhere}
+     ORDER BY start_at DESC`,
+    [...segId.params, ...segPerson.params],
   );
-  return rows.map((row) => ({
+  const seen = new Set<string>();
+  const deduped = rows.filter((row) => {
+    const id = String((row as Record<string, unknown>).id);
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  // 关联服务/员工/门店：数字人对话与日志中心能直接展示项目名、员工名、门店名，而不是只有 id
+  return deduped.map((row) => ({
     ...mapAppointment(row),
     service_name: (row.service_name as string) ?? null,
     staff_name: (row.staff_name as string) ?? null,
@@ -408,22 +530,19 @@ export const stripStoreNameNoise = (value: string): string => {
  *     （"用户确认上海徐汇门店" 命中 "上海徐汇门店"）→ 4) 去「门店/店」后缀的模糊匹配
  *     （"徐汇店" 命中 "上海徐汇门店"）。
  * 仅在在营门店中匹配；同名多店时按名称稳定排序取第一。
+ *
+ * 性能：门店缓存走统一 refCache（fetchActiveStores），匹配逻辑逐字不变，
+ * 排班/库存/幂等不受影响。
  */
+/** @deprecated 统一走 invalidateReferenceCaches()，保留供旧调用兼容 */
+export function invalidateStoreCache() {
+  invalidateReferenceCaches();
+}
+
 export async function findStoreByNameFlexible(text: string): Promise<Store | undefined> {
   const raw = stripStoreNameNoise(text);
   if (!raw) return undefined;
-  const { rows } = await pool.query(
-    `SELECT
-       st.*,
-       COALESCE(array_agg(ss.service_id) FILTER (WHERE ss.service_id IS NOT NULL), '{}') AS service_ids
-     FROM stores st
-     LEFT JOIN store_services ss ON ss.store_id = st.id
-     WHERE st.is_active = true
-     GROUP BY st.id
-     ORDER BY st.name ASC, st.id ASC
-     LIMIT 100`,
-  );
-  const stores = rows.map(mapStore);
+  const stores = await fetchActiveStores();
   const nText = normalizeStoreName(raw);
   if (!nText) return undefined;
   const exact = stores.find((store) => normalizeStoreName(store.name) === nText);
@@ -585,23 +704,25 @@ export async function listBusyAppointments(staffId: string, startAt: string, end
 }
 
 export async function listStaffSkillsForService(serviceId: string, storeId?: string) {
-  const params: unknown[] = [];
-  const conditions: string[] = ['sk.service_id = $1'];
-  params.push(serviceId);
-  if (storeId?.trim()) {
-    params.push(storeId.trim());
-    conditions.push(`s.store_id = $${params.length}`);
-  }
-  const { rows } = await pool.query(
-    `SELECT s.*
-     FROM staff s
-     JOIN staff_service_skills sk ON sk.staff_id = s.id
-     WHERE ${conditions.join(' AND ')}
-       AND s.is_active = true
-     ORDER BY s.name ASC`,
-    params,
-  );
-  return rows.map(mapStaff);
+  return cachedQuery(`skills:${serviceId}|${storeId?.trim() ?? ''}`, async () => {
+    const params: unknown[] = [];
+    const conditions: string[] = ['sk.service_id = $1'];
+    params.push(serviceId);
+    if (storeId?.trim()) {
+      params.push(storeId.trim());
+      conditions.push(`s.store_id = $${params.length}`);
+    }
+    const { rows } = await pool.query(
+      `SELECT s.*
+       FROM staff s
+       JOIN staff_service_skills sk ON sk.staff_id = s.id
+       WHERE ${conditions.join(' AND ')}
+         AND s.is_active = true
+       ORDER BY s.name ASC`,
+      params,
+    );
+    return rows.map(mapStaff);
+  });
 }
 
 export async function searchAvailableTimeSlots(

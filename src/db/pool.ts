@@ -14,6 +14,11 @@ const pool = new Pool({
   // 空闲客户端 30s 回收；连接获取超时 5s（池耗尽时快速失败而非无限挂起）
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
+  // 单条语句 10s 超时：慢查询快速失败，不占着池里的连接把后续工具调用全拖住
+  statement_timeout: 10_000,
+  query_timeout: 10_000,
+  // 保持 TCP 活跃，避免空闲期被 Docker NAT 悄悄断链后下一笔重新建连
+  keepAlive: true,
 });
 
 pool.on('error', (error: Error) => {

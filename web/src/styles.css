@@ -974,6 +974,24 @@ body {
   background: #faad14;
 }
 
+/* ---------- 预约结束时间 ---------- */
+.end-time-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: rgba(20, 16, 43, 0.72);
+}
+.end-time-cell::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #13c2c2, #52c41a);
+  flex: 0 0 7px;
+}
+
 /* ===== 门店可做项目（分类勾选器）===== */
 .service-picker-title {
   display: flex;

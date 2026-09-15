@@ -1,5 +1,5 @@
 import { pool } from '../db/pool.js';
-import { listStaff, listStaffSchedulesBulk } from '../queries.js';
+import { invalidateReferenceCaches, listStaff, listStaffSchedulesBulk } from '../queries.js';
 
 export type EntityType = 'store' | 'staff' | 'service';
 
@@ -47,6 +47,7 @@ export async function createStore(input: { name: string; timezone?: string; serv
     const store = inserted.rows[0];
     await setStoreServices(client, store.id, input.service_ids ?? []);
     await client.query('COMMIT');
+    invalidateReferenceCaches();
     store.service_ids = input.service_ids ?? [];
     await writeEntityAudit({ entity_type: 'store', entity_id: store.id, action: 'create', operator: input.operator, after_data: store });
     return store;
@@ -81,6 +82,7 @@ export async function updateStore(id: string, input: { name?: string; timezone?:
     await client.query('COMMIT');
     const store = updated.rows[0];
     store.service_ids = serviceIds ?? [];
+    invalidateReferenceCaches();
     await writeEntityAudit({ entity_type: 'store', entity_id: id, action: isActive ? 'update' : 'deactivate', operator: input.operator, before_data: before, after_data: store });
     return store;
   } catch (error) {
@@ -97,6 +99,7 @@ export async function deleteStore(id: string, operator?: string) {
   const before = current.rows[0];
   // 软删除：停用而非物理删除，避免破坏历史预约外键（store_services 由 ON DELETE CASCADE 清理）
   const updated = await pool.query(`UPDATE stores SET is_active = false, updated_at = now() WHERE id = $1 RETURNING *`, [id]);
+  invalidateReferenceCaches();
   await writeEntityAudit({ entity_type: 'store', entity_id: id, action: 'delete', operator, before_data: before, after_data: updated.rows[0] });
   return updated.rows[0];
 }
@@ -160,6 +163,7 @@ export async function createStaff(input: { store_id: string; name: string; servi
     const staff = inserted.rows[0];
     await replaceSkills(client, staff.id, input.service_ids ?? []);
     await client.query('COMMIT');
+    invalidateReferenceCaches();
     await writeEntityAudit({ entity_type: 'staff', entity_id: staff.id, action: 'create', operator: input.operator, after_data: { staff, service_ids: input.service_ids ?? [] } });
     return staff;
   } catch (error) {
@@ -196,6 +200,7 @@ export async function updateStaff(id: string, input: { store_id?: string; name?:
     }
     await client.query('COMMIT');
     const staff = updated.rows[0];
+    invalidateReferenceCaches();
     await writeEntityAudit({ entity_type: 'staff', entity_id: id, action: isActive ? 'update' : 'deactivate', operator: input.operator, before_data: before, after_data: { staff, service_ids: serviceIds ?? before.service_ids ?? [] } });
     return staff;
   } catch (error) {
@@ -210,6 +215,7 @@ export async function deleteStaff(id: string, operator?: string) {
   const current = await pool.query('SELECT * FROM staff WHERE id = $1 LIMIT 1', [id]);
   if (!current.rows[0]) return null;
   const updated = await pool.query(`UPDATE staff SET is_active = false, updated_at = now() WHERE id = $1 RETURNING *`, [id]);
+  invalidateReferenceCaches();
   await writeEntityAudit({ entity_type: 'staff', entity_id: id, action: 'delete', operator, before_data: current.rows[0], after_data: updated.rows[0] });
   return updated.rows[0];
 }
@@ -235,6 +241,7 @@ export async function createService(input: {
       [name, duration, input.price_cents ?? null, input.category ?? null, input.aliases ?? []],
     );
     await client.query('COMMIT');
+    invalidateReferenceCaches();
     await writeEntityAudit({ entity_type: 'service', entity_id: inserted.rows[0].id, action: 'create', operator: input.operator, after_data: inserted.rows[0] });
     return inserted.rows[0];
   } catch (error) {
@@ -257,6 +264,7 @@ export async function updateService(id: string, input: { name?: string; duration
     `UPDATE services SET name = $2, duration_minutes = $3, price_cents = $4, is_active = $5, updated_at = now() WHERE id = $1 RETURNING *`,
     [id, name, duration, price, isActive],
   );
+  invalidateReferenceCaches();
   await writeEntityAudit({ entity_type: 'service', entity_id: id, action: input.is_active === false ? 'deactivate' : 'update', operator: input.operator, before_data: before, after_data: updated.rows[0] });
   return updated.rows[0];
 }
@@ -265,6 +273,7 @@ export async function deleteService(id: string, operator?: string) {
   const current = await pool.query('SELECT * FROM services WHERE id = $1 LIMIT 1', [id]);
   if (!current.rows[0]) return null;
   const updated = await pool.query(`UPDATE services SET is_active = false, updated_at = now() WHERE id = $1 RETURNING *`, [id]);
+  invalidateReferenceCaches();
   await writeEntityAudit({ entity_type: 'service', entity_id: id, action: 'delete', operator, before_data: current.rows[0], after_data: updated.rows[0] });
   return updated.rows[0];
 }

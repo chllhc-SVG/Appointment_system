@@ -1,4 +1,5 @@
 import { pool } from '../db/pool.js';
+import { invalidateReferenceCaches } from '../queries.js';
 import { writeEntityAudit } from './catalog.js';
 
 /**
@@ -194,6 +195,7 @@ export async function syncServicesFromKnowledgeBase(options: { operator?: string
       }
 
       await client.query('COMMIT');
+      invalidateReferenceCaches();
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;

@@ -20,6 +20,7 @@ import {
   Spin,
   Table,
   Tag,
+  Tooltip,
   Typography,
   message,
 } from 'antd';
@@ -135,7 +136,7 @@ export function AppointmentsView() {
     <div className="view-stack">
       <Card className="page-header-card" variant="borderless">
         <Title level={2} className="page-title">预约管理</Title>
-        <Paragraph className="page-desc">筛选、确认、签到、完成、取消、爽约与改期，覆盖预约全生命周期。</Paragraph>
+        <Paragraph className="page-desc">筛选、确认、签到、完成、取消、爽约与改期，覆盖预约全生命周期。结束时间 = 开始时间 + 项目时长（建单时落库）。</Paragraph>
       </Card>
 
       <Card className="section-card" variant="borderless">
@@ -183,7 +184,7 @@ export function AppointmentsView() {
           dataSource={items}
           loading={loading}
           size="middle"
-          scroll={{ x: 1200 }}
+          scroll={{ x: 1300 }}
           pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: ['20', '50'] }}
           columns={[
             {
@@ -203,6 +204,16 @@ export function AppointmentsView() {
               width: 170,
               sorter: (a, b) => +new Date(a.appointment.start_at) - +new Date(b.appointment.start_at),
               render: (value: string) => dayjs(value).format('YYYY-MM-DD HH:mm'),
+            },
+            {
+              title: '结束时间',
+              dataIndex: ['appointment', 'end_at'],
+              width: 100,
+              render: (value: string, record) => (
+                <Tooltip title={`按「${record.service_name}」时长推算（开始 + 项目时长）`}>
+                  <span className="end-time-cell">{dayjs(value).format('HH:mm')}</span>
+                </Tooltip>
+              ),
             },
             {
               title: '创建时间',

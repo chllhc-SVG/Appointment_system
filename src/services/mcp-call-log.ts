@@ -58,6 +58,9 @@ const safeStringify = (value: unknown): string => {
  * 共用同一个 pg 连接池。容器冷启动/并发高峰时池子打满，await 写库会让工具响应
  * 串行等待"日志落库"——实测这就是"mcp 日志几十ms、用户体感几秒"的差值来源之一。
  * 调用方 wrapToolCall 内同样只 void，不改返回语义。
+ *
+ * 注：日志落库不在工具响应关键路径上（已 void），因此不对 result 做截断——
+ * 截断省的是日志表体积，换不回 duration_ms，反而丢排查信息，得不偿失。
  */
 export async function recordMcpCall(input: NewMcpCallLog): Promise<void> {
   const log = pushBuffer(box(input));

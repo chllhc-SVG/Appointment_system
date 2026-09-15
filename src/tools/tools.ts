@@ -71,7 +71,7 @@ export const querySlotsInput = z.object({
 export const queryBookingsInput = z.object({
   scope: z.enum(['my', 'detail', 'list', 'audits', 'overview']).describe('查询范围：my=当前顾客预约列表；detail=单条预约详情；list=管理端按条件查询预约列表；audits=单条预约审计轨迹；overview=预约统计概览'),
   appointment_id: z.string().optional(),
-  appointment_code: z.string().optional().describe('预约码，如 apt_20260616_...；查询 detail/audits 时优先用它定位'),
+  appointment_code: z.string().optional().describe('预约码（内部单号 apt_...），服务端定位用；严禁向用户索要或读出，请改用项目名+日期向用户确认是哪一单'),
   customer_id: z.string().optional(),
   customer_phone: z.string().optional().describe('顾客手机号（共享终端双重校验用；传了则必须与 customer_name 同时校验，不单独以手机号定人）'),
   customer_name: z.string().optional().describe('顾客称呼（与 customer_phone 双重校验；防止同名/同号串号）'),
@@ -85,7 +85,7 @@ export const queryBookingsInput = z.object({
   to_date: z.string().optional(),
   limit: z.number().int().min(1).max(100).optional(),
   offset: z.number().int().min(0).optional(),
-}).describe('查询预约：顾客预约列表、单条预约详情、审计轨迹、管理端列表与预约概览统计。【双重校验】共享终端查询本人预约时以会话绑定为准；若 LLM 显式传入 customer_phone/customer_name 则必须两者一致才放行，单手机号或单名字不单独定人，放止同号/同名串号。【播报铁律】向用户播报预约时间一律用 appointment.start_local（北京时间），严禁朗读 start_at（UTC，会把上午十点说成凌晨一点）；报预约码只报 appointment.booking_code 后8位，严禁朗读 appointment_code 全文或内部 id；严禁向用户索要任何编号/ID');
+}).describe('查询预约：顾客预约列表、单条预约详情、审计轨迹、管理端列表与预约概览统计。【双重校验】共享终端查询本人预约时以会话绑定为准；若 LLM 显式传入 customer_phone/customer_name 则必须两者一致才放行，单手机号或单名字不单独定人，放止同号/同名串号。【播报铁律】向用户播报预约时间一律用 appointment.start_local（北京时间），严禁朗读 start_at（UTC，会把上午十点说成凌晨一点）；返回结果不含任何预约码，不要播报或索要 apt_xxx 之类单号/编号/ID，如需确认是哪一单请用项目名+日期；预约成功统一说凭手机号到店核实');
 
 // ===== 预约动作 =====
 
@@ -99,7 +99,7 @@ export const manageBookingInput = z.object({
   staff_name: z.string().min(1).optional().describe('员工名，如"李美容师"；用户指定员工时传入，服务端在门店内按名字解析。【重要】门店名（如"上海徐汇门店"）严禁填入此字段，必须填 store_name；不确定指定人选时留空不填'),
   start_at: z.string().min(1).optional().describe('到店时间：必须是 query_slots 返回的某个时段的 start_at 原文（UTC ISO），或"YYYY-MM-DD HH:mm"（东八区本地时间）。严禁把用户说的本地时间换算后再传。从 query_slots 结果中获取'),
   appointment_id: z.string().min(1).optional(),
-  appointment_code: z.string().min(1).optional().describe('预约码，优先用于精确定位预约'),
+  appointment_code: z.string().min(1).optional().describe('预约码，服务端内部单号；数字人严禁向用户索要或播报，只在 manage_booking 内部改期/取消时透传已拿到的码'),
   new_start_at: z.string().min(1).optional().describe('改期后的新时间（action=reschedule 时必传），格式同 start_at'),
   reason: z.string().optional().describe('取消原因（action=cancel 时可选）'),
   note: z.string().optional().describe('预约备注（action=create 时可选）。仅用于备注信息（如"靠窗""老顾客"）。严禁把门店名/项目名/员工名写进 note——门店用 store_name、项目用 service_name、员工用 staff_name'),
@@ -108,7 +108,7 @@ export const manageBookingInput = z.object({
   status: z.enum(['pending', 'confirmed', 'checked_in', 'completed', 'cancelled', 'no_show']).optional(),
   from_date: z.string().optional(),
   to_date: z.string().optional(),
-}).describe('统一预约动作工具：创建、取消、改期、签到、确认、完成、标记爽约。创建前必须先 query_slots 查可用时段并向用户确认，再调用本工具；服务端会再次校验门店/项目/员工/排班全链路（不在排班内将拒绝 OUTSIDE_SCHEDULE）。取消/改期优先传 appointment_code。【参数铁律】用户提到的门店名必须传 store_name（如"上海徐汇门店"）、项目名传 service_name、员工名传 staff_name，严禁写进 note。【播报铁律】① 顾客身份由系统自动注入，严禁向用户索要或复述编号/ID/手机号（如"请给我编号"是错误行为）；② 向用户播报预约结果时使用返回的 spoken 字段（时间已转本地、预约码只报 booking_code 后8位或干脆不报），严禁朗读 appointment_code 全文（如 apt_20260908_xxx 是内部单号，读出来是严重事故）；③ 时间播报一律用北京时间上午/下午的说法。身份由调用上下文自动注入，无需传 customer_id');
+}).describe('统一预约动作工具：创建、取消、改期、签到、确认、完成、标记爽约。创建前必须先 query_slots 查可用时段并向用户确认，再调用本工具；服务端会再次校验门店/项目/员工/排班全链路（不在排班内将拒绝 OUTSIDE_SCHEDULE）。取消/改期优先传 appointment_code。【参数铁律】用户提到的门店名必须传 store_name（如"上海徐汇门店"）、项目名传 service_name、员工名传 staff_name，严禁写进 note。【播报铁律】① 顾客身份由系统自动注入，严禁向用户索要或复述编号/ID/手机号（如"请给我编号"是错误行为）；② 返回结果不含预约码，也不要向用户播报任何 apt_xxx 之类的单号（历史上朗读单号会导致 TTS 逐字刷屏，属严重事故）；预约成功后只说返回里的 spoken.verification：「预约成功，请凭手机号到店核实」，并播报 spoken.time（北京时间上午/下午说法）；③ 时间播报一律用北京时间上午/下午的说法。身份由调用上下文自动注入，无需传 customer_id');
 
 // ===== 顾客身份 =====
 
@@ -124,6 +124,9 @@ const isRecord = (value: unknown): value is Record<string, unknown> => value !==
 const actionOf = (input: unknown): string => (isRecord(input) && typeof input.action === 'string' ? input.action : '');
 const resourceOf = (input: unknown): string => (isRecord(input) && typeof input.resource === 'string' ? input.resource : '');
 const scopeOf = (input: unknown): string => (isRecord(input) && typeof input.scope === 'string' ? input.scope : '');
+
+/** 顾客到店核实话术：预约码不再下发给数字人（TTS 读码会刷屏），统一改为凭手机号核实。 */
+export const VERIFICATION_HINT = '预约成功，请凭预约时使用的手机号到店核实身份即可，无需报预约码。';
 
 const only = <T extends Record<string, unknown>>(input: unknown, keys: string[]): T => {
   const record = isRecord(input) ? input : {};
@@ -224,21 +227,33 @@ const querySlotsHandler = async (input: unknown) => {
   return searchAvailableSlots(only(input, ['service_id', 'service_name', 'store_id', 'store_name', 'date', 'preferred_staff_id', 'preferred_staff_name']) as unknown as Parameters<typeof searchAvailableSlots>[0]);
 };
 
-/** 播报辅助：给预约相关返回补 start_local（北京时间）与 booking_code 短码。
- *  LLM 播报一律用这些字段，避免把 UTC ISO（如 2026-09-09T01:00:00Z）误读成"凌晨一点"。 */
+/** 播报辅助：给预约相关返回补 start_local（北京时间）。
+ *  LLM 播报一律用这些字段，避免把 UTC ISO（如 2026-09-09T01:00:00Z）误读成"凌晨一点"。
+ *
+ * 【不再下发预约码】线上事故：数字人把 apt_20260915_xxxx 整串当话术念出来，
+ * TTS 把十六进制逐字符读成"零么幺幺…"并刷屏。预约码只用于门店后台核对，
+ * 顾客到店凭手机号核实即可，因此这里把 appointment_code / booking_code 从
+ * 数字人可见的返回中彻底剥离（管理后台 REST 接口不受影响，仍能看到全码）。 */
+const CODE_FIELDS = ['appointment_code', 'booking_code'] as const;
+
+const stripCodes = <T extends Record<string, unknown>>(record: T): T => {
+  const next: Record<string, unknown> = { ...record };
+  for (const field of CODE_FIELDS) delete next[field];
+  return next as T;
+};
+
 function decorateAppointmentsForSpeech(result: unknown): unknown {
   const decorateAppointment = (appointment: Record<string, unknown> | undefined | null) => {
     if (!appointment || typeof appointment !== 'object') return appointment;
-    return {
+    return stripCodes({
       ...appointment,
       start_local: appointment.start_at ? formatBeijing(String(appointment.start_at)) : undefined,
-      booking_code: appointment.appointment_code ? String(appointment.appointment_code).slice(-8) : undefined,
-    };
+    });
   };
   const decorateItem = (item: unknown) => {
     if (!item || typeof item !== 'object') return item;
     const record = item as Record<string, unknown>;
-    // 列表项两种形态：{ appointment: {...} } 详情包装，或预约对象本身（含 appointment_code 字段）
+    // 列表项两种形态：{ appointment: {...} } 详情包装，或预约对象本身（含 start_at 字段）
     if ('appointment' in record) return { ...record, appointment: decorateAppointment(record.appointment as Record<string, unknown>) };
     if ('appointment_code' in record || 'start_at' in record) return decorateAppointment(record);
     return item;
@@ -500,16 +515,21 @@ const manageBookingHandler = async (input: unknown) => {
   }
   const speak = async (result: unknown) => {
     const record = result as Record<string, unknown> | null;
-    if (!record || record.success !== true) return result;
-    // create 已在服务层返回 spoken；其余动作（cancel/reschedule 等）在此统一补口播字段
+    if (!record || record.success !== true) return decorateAppointmentsForSpeech(result);
+    // create 已在服务层返回 spoken；其余动作（cancel/reschedule 等）在此统一补口播字段。
+    // 口播只给时间与到店核实话术，绝不下发预约码（TTS 读码会刷屏）。
     if (!record.spoken && record.appointment) {
-      const appointment = record.appointment as { start_at?: string; appointment_code?: string };
+      const appointment = record.appointment as { start_at?: string };
       record.spoken = {
         time: appointment.start_at ? formatBeijing(appointment.start_at) : undefined,
-        booking_code: appointment.appointment_code ? appointment.appointment_code.slice(-8) : undefined,
+        verification: VERIFICATION_HINT,
       };
     }
-    return decorateAppointmentsForSpeech(record);
+    const decorated = decorateAppointmentsForSpeech(record) as Record<string, unknown>;
+    if (decorated && typeof decorated === 'object' && decorated.spoken && typeof decorated.spoken === 'object') {
+      decorated.spoken = stripCodes(decorated.spoken as Record<string, unknown>);
+    }
+    return decorated;
   };
   switch (action) {
     case 'create': {

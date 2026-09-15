@@ -95,6 +95,12 @@ export function OverviewView() {
               render: (value: string) => new Date(value).toLocaleString('zh-CN'),
             },
             {
+              title: '结束时间',
+              dataIndex: ['appointment', 'end_at'],
+              width: 100,
+              render: (value: string) => <span className="end-time-cell">{new Date(value).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</span>,
+            },
+            {
               title: '状态',
               dataIndex: ['appointment', 'status'],
               width: 100,

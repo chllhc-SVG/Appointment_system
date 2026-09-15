@@ -290,6 +290,7 @@ export async function searchAvailableSlots(input: SearchSlotsInput): Promise<
     // 用户体感几秒"的最大元凶——大载荷直接拖慢 LLM 的 tool-result 解析与二次生成。
     // end_local 可由 start_local+duration_minutes 推导；start_at/end_at 仍传原文
     // 供 manage_booking(action=create) 回填 start_at 用。
+    // 不截断：截断会隐藏可约时段，属于行为变化；耗时优化靠减少 DB 往返与走索引解决。
     slots: slots.map((slot) => ({
       staff_name: slot.staff_name,
       start_local: slot.start_local,
@@ -318,6 +319,30 @@ const dayjsAddDays = (date: string, days: number) => {
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
 };
+
+/**
+ * 建单幂等预查：先按 idempotency_key 唯一索引查（绝大多数命中走这里，一次即回）；
+ * 未命中再按「客户+项目+员工+时段」四元组查（idx_appointments_idem4），等价于原
+ * `WHERE key=$1 OR (四元组)`，只是把 OR 拆成两次索引查询，避免计划器退化成全表扫。
+ * 语义与原 OR 完全等价：任一条件命中即返回同一行。
+ */
+async function findExistingAppointmentForCreate(input: {
+  idempotencyKey: string;
+  customerId: string;
+  serviceId: string;
+  staffId: string;
+  startAt: string;
+}) {
+  const byKey = await pool.query(`SELECT * FROM appointments WHERE idempotency_key = $1 LIMIT 1`, [input.idempotencyKey]);
+  if (byKey.rows[0]) return byKey.rows[0];
+  const bySlot = await pool.query(
+    `SELECT * FROM appointments
+     WHERE customer_id = $1 AND service_id = $2 AND staff_id = $3 AND start_at = $4::timestamptz
+     LIMIT 1`,
+    [input.customerId, input.serviceId, input.staffId, input.startAt],
+  );
+  return bySlot.rows[0];
+}
 
 export async function createAppointment(input: CreateAppointmentInput) {
   // 先解析门店（支持门店名 + 单店自动兜底），项目解析限定在门店可做范围内
@@ -389,14 +414,14 @@ export async function createAppointment(input: CreateAppointmentInput) {
     input.idempotency_key?.trim() ?? `create:${customerId ?? 'anon'}:${service.id}:${staff.id}:${startAt}`,
   );
 
-  const existing = await pool.query(
-    `SELECT * FROM appointments
-     WHERE idempotency_key = $1
-        OR (customer_id = $2 AND service_id = $3 AND staff_id = $4 AND start_at = $5::timestamptz)
-     LIMIT 1`,
-    [idempotencyKey, customerId ?? 'anon', service.id, staff.id, startAt],
-  );
-  const existingAppointment = existing.rows[0] ? toAppointment(existing.rows[0] as Record<string, unknown>) : undefined;
+  const existing = await findExistingAppointmentForCreate({
+    idempotencyKey,
+    customerId: customerId ?? 'anon',
+    serviceId: service.id,
+    staffId: staff.id,
+    startAt,
+  });
+  const existingAppointment = existing ? toAppointment(existing as Record<string, unknown>) : undefined;
   const existingActive = existingAppointment != null && ['pending', 'confirmed', 'checked_in'].includes(existingAppointment.status);
   // 同请求重复提交（网络重试/口误重复确认）→ 幂等返回原单；
   // 注意：取消后重约的新单幂等键带 :rebook: 后缀，故同时按「客户+项目+员工+时段」命中活动单。
@@ -405,7 +430,8 @@ export async function createAppointment(input: CreateAppointmentInput) {
       success: true,
       appointment: existingAppointment,
       deduplicated: true,
-      spoken: { time: formatBeijing(existingAppointment.start_at), booking_code: existingAppointment.appointment_code.slice(-8) },
+      /** 口播只给时间与到店核实话术：预约码不再下发给数字人（TTS 读码会逐字刷屏） */
+      spoken: { time: formatBeijing(existingAppointment.start_at), verification: '预约成功，请凭预约时使用的手机号到店核实身份即可，无需报预约码。' },
       ...(storeAutoSelected ? { store_auto_selected: true, store: { id: store.id, name: store.name } } : {}),
     };
   }
@@ -439,10 +465,11 @@ export async function createAppointment(input: CreateAppointmentInput) {
     return {
       success: true,
       appointment,
-      /** 口播专用：数字人向用户播报时使用，严禁朗读 appointment_code 全文或内部 id */
+      /** 口播专用：数字人向用户播报时使用。严禁朗读 appointment_code 全文或内部 id，
+       *  故此处不再下发 booking_code，只给时间与"凭手机号到店核实"话术。 */
       spoken: {
         time: formatBeijing(startAt),
-        booking_code: appointment.appointment_code.slice(-8),
+        verification: '预约成功，请凭预约时使用的手机号到店核实身份即可，无需报预约码。',
       },
       ...(storeAutoSelected ? { store_auto_selected: true, store: { id: store.id, name: store.name } } : {}),
     };
